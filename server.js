@@ -9,6 +9,7 @@ import { extractTextFromPDF } from "./lib/pdfLoader.js";
 import { splitText } from "./lib/textSplitter.js";
 import { storeDocuments } from "./lib/vectorStore.js";
 import { generateQuiz } from "./lib/quizGenerator.js";
+import { summarizeDocs, textToAudio } from "./lib/summarizer.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -71,8 +72,11 @@ app.post('/api/upload', upload.single('pdf'), async (req, res) => {
         // Use the filename as a unique collection name for this user's PDF
         const vectorStore = await storeDocuments(docs, sessionId);
 
-        // Cache the vector store for quiz generation
-        sessionCache[sessionId] = vectorStore;
+        // Cache the vector store and raw docs for quiz and summary generation
+        sessionCache[sessionId] = {
+            vectorStore: vectorStore,
+            docs: docs
+        };
 
         res.json({
             message: 'PDF processed successfully',
@@ -93,10 +97,11 @@ app.post('/api/quiz', async (req, res) => {
             return res.status(400).json({ error: 'Session ID is required' });
         }
 
-        const vectorStore = sessionCache[sessionId];
-        if (!vectorStore) {
+        const session = sessionCache[sessionId];
+        if (!session || !session.vectorStore) {
             return res.status(404).json({ error: 'Session not found or expired. Please upload the PDF again.' });
         }
+        const vectorStore = session.vectorStore;
 
         // Generate the quiz
         const quizData = await generateQuiz(vectorStore, {
@@ -109,6 +114,36 @@ app.post('/api/quiz', async (req, res) => {
     } catch (error) {
         console.error("Quiz generation error:", error);
         res.status(500).json({ error: error.message || "Failed to generate quiz" });
+    }
+});
+
+app.post('/api/summary', async (req, res) => {
+    try {
+        const { sessionId } = req.body;
+
+        if (!sessionId) {
+            return res.status(400).json({ error: 'Session ID is required' });
+        }
+
+        const session = sessionCache[sessionId];
+        if (!session || !session.docs) {
+            return res.status(404).json({ error: 'Session not found or expired. Please upload the PDF again.' });
+        }
+
+        console.log(`Generating summary for session: ${sessionId}`);
+        const summary = await summarizeDocs(session.docs);
+
+        console.log(`Converting summary to audio...`);
+        const audio = await textToAudio(summary);
+
+        res.json({
+            summary: summary,
+            audio: audio
+        });
+
+    } catch (error) {
+        console.error("Summary/TTS error:", error);
+        res.status(500).json({ error: error.message || "Failed to generate summary or audio" });
     }
 });
 

@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -40,6 +41,7 @@
             margin-bottom: 2rem;
             background: linear-gradient(to right, #60a5fa, #a78bfa);
             -webkit-background-clip: text;
+            background-clip: text;
             -webkit-text-fill-color: transparent;
         }
 
@@ -64,7 +66,9 @@
             color: var(--text-secondary);
         }
 
-        input[type="text"], input[type="number"], input[type="file"] {
+        input[type="text"],
+        input[type="number"],
+        input[type="file"] {
             width: 100%;
             padding: 0.75rem;
             border-radius: 8px;
@@ -111,8 +115,13 @@
         }
 
         @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
+            0% {
+                transform: rotate(0deg);
+            }
+
+            100% {
+                transform: rotate(360deg);
+            }
         }
 
         /* Quiz specific styles */
@@ -188,12 +197,13 @@
         .error-msg {
             color: var(--error);
         }
-        
+
         .success-msg {
             color: var(--success);
         }
     </style>
 </head>
+
 <body>
 
     <div class="container">
@@ -224,6 +234,16 @@
             <button id="generate-btn">Generate Master Quiz</button>
             <div id="generate-status" class="status-msg"></div>
             <div id="generate-loader" class="loader hidden"></div>
+        </div>
+
+        <!-- Step 2.5: Summary -->
+        <div class="card hidden" id="summary-section">
+            <h2 style="margin-top:0">PDF Summary</h2>
+            <button id="summary-btn" onclick="generateSummary()">🔊 Summarize PDF</button>
+            <div id="summary-loader" class="loader hidden"></div>
+            <div id="summary-status" class="status-msg"></div>
+            <audio id="summary-audio" controls style="display:none; width:100%; margin-top:1rem"></audio>
+            <p id="summary-text" style="margin-top:1rem; line-height:1.8; color:var(--text-secondary)"></p>
         </div>
 
         <!-- Step 3: Take Quiz -->
@@ -289,15 +309,16 @@
                     method: 'POST',
                     body: formData
                 });
-                
+
                 const data = await response.json();
-                
+
                 if (response.ok) {
                     sessionId = data.sessionId;
                     uploadStatus.textContent = "PDF Processed Successfully!";
                     uploadStatus.className = "status-msg success-msg";
                     setTimeout(() => {
                         document.getElementById('upload-section').classList.add('hidden');
+                        document.getElementById('summary-section').classList.remove('hidden');
                         configSection.classList.remove('hidden');
                     }, 1000);
                 } else {
@@ -352,7 +373,7 @@
         // 3. Render Quiz
         function renderQuiz() {
             quizContainer.innerHTML = '';
-            
+
             currentQuiz.forEach((q, index) => {
                 const block = document.createElement('div');
                 block.className = 'question-block';
@@ -372,7 +393,7 @@
                     radio.type = 'radio';
                     radio.name = `question-${index}`;
                     radio.value = optIndex;
-                    
+
                     label.appendChild(radio);
                     label.appendChild(document.createTextNode(opt));
                     block.appendChild(label);
@@ -395,7 +416,7 @@
 
             currentQuiz.forEach((q, index) => {
                 const selected = document.querySelector(`input[name="question-${index}"]:checked`);
-                
+
                 if (!selected) {
                     answeredAll = false;
                     return;
@@ -435,14 +456,60 @@
             resultsSection.classList.add('hidden');
             quizSection.classList.add('hidden');
             submitQuizBtn.classList.remove('hidden');
-            
+
             generateBtn.disabled = false;
             generateStatus.textContent = '';
-            
+
             configSection.classList.remove('hidden');
+            document.getElementById('summary-section').classList.remove('hidden');
+            document.getElementById('summary-text').textContent = '';
+            document.getElementById('summary-audio').style.display = 'none';
+            document.getElementById('summary-status').textContent = '';
+            document.getElementById('summary-status').className = 'status-msg';
+
             window.scrollTo(0, 0);
         });
 
+        // 6. Generate Summary
+        async function generateSummary() {
+            const btn = document.getElementById('summary-btn');
+            const loader = document.getElementById('summary-loader');
+            const status = document.getElementById('summary-status');
+
+            btn.disabled = true;
+            loader.classList.remove('hidden');
+            status.textContent = 'Generating summary and audio...';
+
+            try {
+                const res = await fetch('/api/summary', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sessionId })
+                });
+
+                const data = await res.json();
+
+                if (!res.ok) {
+                    throw new Error(data.error || "Failed to generate summary");
+                }
+
+                document.getElementById('summary-text').textContent = data.summary;
+
+                const audioEl = document.getElementById('summary-audio');
+                audioEl.src = `data:audio/mp3;base64,${data.audio}`;
+                audioEl.style.display = 'block';
+                status.textContent = '';
+                status.className = 'status-msg';
+            } catch (err) {
+                status.textContent = err.message;
+                status.className = 'status-msg error-msg';
+            } finally {
+                btn.disabled = false;
+                loader.classList.add('hidden');
+            }
+        }
+
     </script>
 </body>
+
 </html>
