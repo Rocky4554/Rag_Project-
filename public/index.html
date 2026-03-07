@@ -201,6 +201,55 @@
         .success-msg {
             color: var(--success);
         }
+
+        /* Chat styles */
+        .chat-container {
+            border: 1px solid var(--overlay-color);
+            border-radius: 8px;
+            padding: 1rem;
+            height: 300px;
+            overflow-y: auto;
+            margin-bottom: 1rem;
+            background: rgba(0, 0, 0, 0.2);
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+
+        .chat-message {
+            padding: 0.75rem 1rem;
+            border-radius: 8px;
+            max-width: 85%;
+            line-height: 1.5;
+        }
+
+        .chat-user {
+            background: var(--brand-primary);
+            color: white;
+            align-self: flex-end;
+            border-bottom-right-radius: 2px;
+        }
+
+        .chat-ai {
+            background: var(--overlay-color);
+            color: var(--text-primary);
+            align-self: flex-start;
+            border-bottom-left-radius: 2px;
+        }
+
+        .chat-input-group {
+            display: flex;
+            gap: 0.5rem;
+        }
+
+        .chat-input-group input {
+            flex-grow: 1;
+            margin-bottom: 0;
+        }
+
+        .chat-input-group button {
+            width: auto;
+        }
     </style>
 </head>
 
@@ -244,6 +293,22 @@
             <div id="summary-status" class="status-msg"></div>
             <audio id="summary-audio" controls style="display:none; width:100%; margin-top:1rem"></audio>
             <p id="summary-text" style="margin-top:1rem; line-height:1.8; color:var(--text-secondary)"></p>
+        </div>
+
+        <!-- NEW Step: Chatbot -->
+        <div class="card hidden" id="chat-section">
+            <h2 style="margin-top:0">Chat with PDF</h2>
+            <p style="color:var(--text-secondary); margin-bottom:1rem; font-size:0.9rem;">Ask any specific questions
+                about the document.</p>
+            <div class="chat-container" id="chat-history">
+                <div class="chat-message chat-ai">Hi! I've read the document. What would you like to know?</div>
+            </div>
+            <div class="chat-input-group">
+                <input type="text" id="chat-input" placeholder="Type your question here..."
+                    onkeypress="if(event.key === 'Enter') sendChatMessage()">
+                <button id="chat-send-btn" onclick="sendChatMessage()">Send</button>
+            </div>
+            <div id="chat-status" class="status-msg"></div>
         </div>
 
         <!-- Step 3: Take Quiz -->
@@ -319,6 +384,7 @@
                     setTimeout(() => {
                         document.getElementById('upload-section').classList.add('hidden');
                         document.getElementById('summary-section').classList.remove('hidden');
+                        document.getElementById('chat-section').classList.remove('hidden');
                         configSection.classList.remove('hidden');
                     }, 1000);
                 } else {
@@ -507,6 +573,60 @@
                 btn.disabled = false;
                 loader.classList.add('hidden');
             }
+        }
+
+        // 7. Chat System
+        async function sendChatMessage() {
+            const inputEl = document.getElementById('chat-input');
+            const btn = document.getElementById('chat-send-btn');
+            const history = document.getElementById('chat-history');
+            const status = document.getElementById('chat-status');
+
+            const question = inputEl.value.trim();
+            if (!question) return;
+
+            // Add user message
+            addMessageToChat(question, 'chat-user');
+            inputEl.value = '';
+            btn.disabled = true;
+            inputEl.disabled = true;
+            status.textContent = 'Thinking...';
+            status.className = 'status-msg';
+
+            try {
+                const res = await fetch('/api/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sessionId, question })
+                });
+
+                const data = await res.json();
+
+                if (!res.ok) {
+                    throw new Error(data.error || "Failed to get answer");
+                }
+
+                addMessageToChat(data.answer, 'chat-ai');
+                status.textContent = '';
+            } catch (err) {
+                status.textContent = err.message;
+                status.className = 'status-msg error-msg';
+                addMessageToChat("Sorry, I encountered an error answering that.", 'chat-ai');
+            } finally {
+                btn.disabled = false;
+                inputEl.disabled = false;
+                inputEl.focus();
+            }
+        }
+
+        function addMessageToChat(text, cssClass) {
+            const history = document.getElementById('chat-history');
+            const msgDiv = document.createElement('div');
+            msgDiv.className = `chat-message ${cssClass}`;
+            // Convert simple markdown-like newlines to breaks
+            msgDiv.innerHTML = text.replace(/\ng/, '<br>');
+            history.appendChild(msgDiv);
+            history.scrollTop = history.scrollHeight;
         }
 
     </script>

@@ -10,6 +10,8 @@ import { splitText } from "./lib/textSplitter.js";
 import { storeDocuments } from "./lib/vectorStore.js";
 import { generateQuiz } from "./lib/quizGenerator.js";
 import { summarizeDocs, textToAudio } from "./lib/summarizer.js";
+import { queryRAG } from "./lib/rag.js";
+import { HumanMessage, AIMessage } from "@langchain/core/messages";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -72,10 +74,11 @@ app.post('/api/upload', upload.single('pdf'), async (req, res) => {
         // Use the filename as a unique collection name for this user's PDF
         const vectorStore = await storeDocuments(docs, sessionId);
 
-        // Cache the vector store and raw docs for quiz and summary generation
+        // Cache the vector store, raw docs, and an empty chat history array
         sessionCache[sessionId] = {
             vectorStore: vectorStore,
-            docs: docs
+            docs: docs,
+            chatHistory: []
         };
 
         res.json({
@@ -144,6 +147,41 @@ app.post('/api/summary', async (req, res) => {
     } catch (error) {
         console.error("Summary/TTS error:", error);
         res.status(500).json({ error: error.message || "Failed to generate summary or audio" });
+    }
+});
+
+app.post('/api/chat', async (req, res) => {
+    try {
+        const { sessionId, question } = req.body;
+
+        if (!sessionId || !question) {
+            return res.status(400).json({ error: 'Session ID and question are required' });
+        }
+
+        const session = sessionCache[sessionId];
+        if (!session || !session.vectorStore) {
+            return res.status(404).json({ error: 'Session not found or expired. Please upload the PDF again.' });
+        }
+
+        console.log(`Chat request: "${question}" for session: ${sessionId}`);
+
+        // Use the stored history to understand follow-up questions
+        const answer = await queryRAG(session.vectorStore, question, session.chatHistory);
+
+        // Save this exchange to the session's memory for the next follow-up question
+        session.chatHistory.push(new HumanMessage(question));
+        session.chatHistory.push(new AIMessage(answer));
+
+        // Limit history to last 10 exchanges (20 messages) to prevent context bloat
+        if (session.chatHistory.length > 20) {
+            session.chatHistory = session.chatHistory.slice(session.chatHistory.length - 20);
+        }
+
+        res.json({ answer: answer });
+
+    } catch (error) {
+        console.error("Chat error:", error);
+        res.status(500).json({ error: error.message || "Failed to get answer" });
     }
 });
 
