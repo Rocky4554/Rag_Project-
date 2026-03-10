@@ -250,6 +250,159 @@
         .chat-input-group button {
             width: auto;
         }
+
+        /* === Interview - hands-free === */
+        .iv-status-bar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0.5rem 0;
+            margin-bottom: 0.75rem;
+        }
+
+        .iv-badge {
+            font-size: 0.8rem;
+            padding: 3px 10px;
+            border-radius: 20px;
+            background: var(--overlay-color);
+            font-weight: 600;
+        }
+
+        .iv-state {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+        }
+
+        .iv-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: var(--overlay-color);
+            flex-shrink: 0;
+        }
+
+        .iv-dot.speaking {
+            background: var(--brand-primary);
+            animation: pulse-blue 1.2s infinite;
+        }
+
+        .iv-dot.listening {
+            background: var(--error);
+            animation: pulse-red 1.2s infinite;
+        }
+
+        .iv-dot.thinking {
+            background: #f59e0b;
+            animation: pulse-amber 1.2s infinite;
+        }
+
+        @keyframes pulse-blue {
+
+            0%,
+            100% {
+                opacity: 1
+            }
+
+            50% {
+                opacity: .3
+            }
+        }
+
+        @keyframes pulse-amber {
+
+            0%,
+            100% {
+                opacity: 1
+            }
+
+            50% {
+                opacity: .3
+            }
+        }
+
+        .iv-transcript {
+            height: 340px;
+            overflow-y: auto;
+            padding: 1rem;
+            background: rgba(0, 0, 0, 0.25);
+            border: 1px solid var(--overlay-color);
+            border-radius: 8px;
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+            margin-bottom: 0.75rem;
+        }
+
+        .iv-line {
+            display: flex;
+            gap: 0.5rem;
+            align-items: flex-start;
+        }
+
+        .iv-line.ai {
+            justify-content: flex-start;
+        }
+
+        .iv-line.user {
+            justify-content: flex-end;
+        }
+
+        .iv-bubble {
+            padding: 0.6rem 0.9rem;
+            border-radius: 12px;
+            max-width: 80%;
+            line-height: 1.5;
+            font-size: 0.92rem;
+        }
+
+        .iv-line.ai .iv-bubble {
+            background: var(--overlay-color);
+            border-bottom-left-radius: 3px;
+        }
+
+        .iv-line.user .iv-bubble {
+            background: var(--brand-primary);
+            color: white;
+            border-bottom-right-radius: 3px;
+        }
+
+        .iv-interim {
+            font-style: italic;
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+            min-height: 1.2rem;
+            text-align: center;
+        }
+
+        .iv-report {
+            margin-top: 1.5rem;
+            padding: 1.5rem;
+            background: rgba(34, 197, 94, 0.05);
+            border: 1px solid var(--success);
+            border-radius: 8px;
+            line-height: 1.8;
+        }
+
+        .recording {
+            animation: pulse-red 1.5s infinite;
+        }
+
+        @keyframes pulse-red {
+            0% {
+                box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7);
+            }
+
+            70% {
+                box-shadow: 0 0 0 10px rgba(239, 68, 68, 0);
+            }
+
+            100% {
+                box-shadow: 0 0 0 0 rgba(239, 68, 68, 0);
+            }
+        }
     </style>
 </head>
 
@@ -309,6 +462,48 @@
                 <button id="chat-send-btn" onclick="sendChatMessage()">Send</button>
             </div>
             <div id="chat-status" class="status-msg"></div>
+        </div>
+
+        <!-- Voice Interview – hands-free -->
+        <div class="card hidden" id="interview-section">
+            <h2 style="margin-top:0">🎙️ AI Voice Interview</h2>
+            <p style="color:var(--text-secondary); margin-bottom:1rem; font-size:0.9rem;">Speak naturally. The AI
+                listens automatically after each question.</p>
+
+            <!-- Setup screen -->
+            <div id="interview-setup">
+                <div class="form-group">
+                    <label for="interview-length">Number of Questions</label>
+                    <input type="number" id="interview-length" min="3" max="10" value="5">
+                </div>
+                <button id="start-interview-btn" onclick="startInterview()">Start Interview</button>
+            </div>
+
+            <!-- Active interview -->
+            <div id="interview-active" class="hidden">
+                <div class="iv-status-bar">
+                    <span id="iv-progress" style="font-weight:700;color:var(--brand-primary);">Question 1 / 5</span>
+                    <div class="iv-state">
+                        <div class="iv-dot" id="iv-dot"></div>
+                        <span id="iv-state-label">Starting...</span>
+                    </div>
+                    <span id="iv-difficulty" class="iv-badge">Medium</span>
+                </div>
+
+                <!-- Live transcript -->
+                <div class="iv-transcript" id="iv-transcript"></div>
+
+                <!-- Interim / live speech feedback -->
+                <div class="iv-interim" id="iv-interim"></div>
+            </div>
+
+            <!-- Final report -->
+            <div id="iv-report-section" class="hidden">
+                <h3 style="color:var(--success);text-align:center;margin-top:1.5rem;">📋 Final Interview Report</h3>
+                <div class="iv-report" id="iv-report-content"></div>
+            </div>
+
+            <div id="interview-status" class="status-msg" style="margin-top:0.75rem;"></div>
         </div>
 
         <!-- Step 3: Take Quiz -->
@@ -385,6 +580,7 @@
                         document.getElementById('upload-section').classList.add('hidden');
                         document.getElementById('summary-section').classList.remove('hidden');
                         document.getElementById('chat-section').classList.remove('hidden');
+                        document.getElementById('interview-section').classList.remove('hidden');
                         configSection.classList.remove('hidden');
                     }, 1000);
                 } else {
@@ -624,10 +820,249 @@
             const msgDiv = document.createElement('div');
             msgDiv.className = `chat-message ${cssClass}`;
             // Convert simple markdown-like newlines to breaks
-            msgDiv.innerHTML = text.replace(/\ng/, '<br>');
+            msgDiv.innerHTML = text.replace(/\n/g, '<br>');
             history.appendChild(msgDiv);
             history.scrollTop = history.scrollHeight;
         }
+
+        // ═══════════════════════════════════════════
+        // 8. VOICE INTERVIEW — Hands-Free System
+        // ═══════════════════════════════════════════
+        let ivRecognition = null;
+        let ivLength = 5;
+        let ivCurrentAnswer = '';
+        let ivSilenceTimer = null;
+        let ivIsListening = false;
+        const ivAudio = new Audio();
+
+        // ── Helpers ──────────────────────────────────
+        function ivSetState(mode, label) {
+            // mode: 'idle' | 'speaking' | 'listening' | 'thinking'
+            const dot = document.getElementById('iv-dot');
+            const lbl = document.getElementById('iv-state-label');
+            dot.className = 'iv-dot ' + (mode === 'idle' ? '' : mode);
+            lbl.textContent = label;
+        }
+
+        function ivAddLine(role, text) {
+            // role: 'ai' | 'user'
+            const box = document.getElementById('iv-transcript');
+            const line = document.createElement('div');
+            line.className = 'iv-line ' + role;
+            const bubble = document.createElement('div');
+            bubble.className = 'iv-bubble';
+            bubble.innerHTML = text.replace(/\n/g, '<br>');
+            line.appendChild(bubble);
+            box.appendChild(line);
+            box.scrollTop = box.scrollHeight;
+        }
+
+        function ivSetInterim(text) {
+            document.getElementById('iv-interim').textContent = text;
+        }
+
+        function ivUpdateProgress(num, difficulty) {
+            document.getElementById('iv-progress').textContent = `Question ${num} / ${ivLength}`;
+            document.getElementById('iv-difficulty').textContent =
+                difficulty ? difficulty.charAt(0).toUpperCase() + difficulty.slice(1) : '';
+        }
+
+        function ivPlayAudio(base64, callback) {
+            if (!base64) { if (callback) callback(); return; }
+            ivSetState('speaking', 'AI Speaking...');
+            ivAudio.src = `data:audio/mp3;base64,${base64}`;
+            ivAudio.onended = () => { if (callback) callback(); };
+            ivAudio.onerror = () => { if (callback) callback(); };
+            ivAudio.play().catch(() => { if (callback) callback(); });
+        }
+
+        function ivPlayAudioSequence(base64Array, callback) {
+            const validAudios = base64Array.filter(Boolean);
+            if (validAudios.length === 0) {
+                if (callback) callback();
+                return;
+            }
+
+            let currentIndex = 0;
+
+            function playNext() {
+                if (currentIndex >= validAudios.length) {
+                    if (callback) callback();
+                    return;
+                }
+
+                ivSetState('speaking', 'AI Speaking...');
+                ivAudio.src = `data:audio/mp3;base64,${validAudios[currentIndex]}`;
+                ivAudio.onended = () => {
+                    currentIndex++;
+                    playNext();
+                };
+                ivAudio.onerror = () => {
+                    currentIndex++;
+                    playNext();
+                };
+                ivAudio.play().catch(() => {
+                    currentIndex++;
+                    playNext();
+                });
+            }
+
+            playNext();
+        }
+
+        // ── Start listening; auto-submit after 2s silence ─
+        function ivStartListening() {
+            if (!ivRecognition) {
+                // Fallback: no speech recognition available
+                ivSetState('idle', 'Speech recognition unavailable in this browser');
+                return;
+            }
+            ivCurrentAnswer = '';
+            ivSetInterim('');
+            ivSetState('listening', 'Listening... speak your answer');
+            ivIsListening = true;
+
+            ivRecognition.onresult = (e) => {
+                let interim = '';
+                let final = '';
+                for (let i = e.resultIndex; i < e.results.length; i++) {
+                    if (e.results[i].isFinal) final += e.results[i][0].transcript + ' ';
+                    else interim += e.results[i][0].transcript;
+                }
+                if (final) {
+                    ivCurrentAnswer += final;
+                    // Reset silence timer each time we get final speech
+                    clearTimeout(ivSilenceTimer);
+                    ivSilenceTimer = setTimeout(ivOnSilence, 2000);
+                }
+                ivSetInterim(interim || ivCurrentAnswer ? `"${(ivCurrentAnswer + interim).trim()}"` : '');
+            };
+
+            ivRecognition.onspeechend = () => {
+                // Silence detected by browser — start 1.5s countdown
+                clearTimeout(ivSilenceTimer);
+                ivSilenceTimer = setTimeout(ivOnSilence, 1500);
+            };
+
+            ivRecognition.onerror = (e) => {
+                console.warn('STT error:', e.error);
+                if (e.error === 'no-speech') ivOnSilence();
+            };
+
+            ivRecognition.onend = () => {
+                // Restart if still in listening mode and haven't auto-submitted yet
+                if (ivIsListening) {
+                    try { ivRecognition.start(); } catch (_) { }
+                }
+            };
+
+            try { ivRecognition.start(); } catch (_) { }
+        }
+
+        function ivOnSilence() {
+            if (!ivIsListening) return;
+            ivIsListening = false;
+            try { ivRecognition.stop(); } catch (_) { }
+            clearTimeout(ivSilenceTimer);
+
+            const answer = ivCurrentAnswer.trim();
+            ivSetInterim('');
+            if (answer.length < 3) {
+                // Too short — re-listen
+                ivSetState('listening', 'I did not catch that. Please speak again...');
+                setTimeout(ivStartListening, 1200);
+                return;
+            }
+            ivAddLine('user', answer);
+            ivSubmitAnswer(answer);
+        }
+
+        // ── API calls ────────────────────────────────
+        async function startInterview() {
+            ivLength = parseInt(document.getElementById('interview-length').value) || 5;
+            document.getElementById('interview-setup').classList.add('hidden');
+            document.getElementById('interview-active').classList.remove('hidden');
+            document.getElementById('interview-status').textContent = '';
+            ivSetState('thinking', 'Preparing your interview...');
+
+            // Greet the user first
+            const greetText = `Hello! Welcome to your AI voice interview. I will ask you ${ivLength} questions based on the document you uploaded. After I finish asking each question, your microphone will activate automatically. Please answer clearly. Let's begin!`;
+            ivAddLine('ai', greetText);
+
+            try {
+                const res = await fetch('/api/interview/start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sessionId, maxQuestions: ivLength })
+                });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.error);
+
+                ivUpdateProgress(data.questionNumber, data.difficulty);
+                ivAddLine('ai', data.question);
+
+                // Speak greeting + question, then start mic
+                ivPlayAudioSequence([data.feedbackCachedAudio, data.audio], () => ivStartListening());
+
+            } catch (err) {
+                document.getElementById('interview-status').textContent = err.message;
+                document.getElementById('interview-status').className = 'status-msg error-msg';
+                document.getElementById('interview-setup').classList.remove('hidden');
+                document.getElementById('interview-active').classList.add('hidden');
+            }
+        }
+
+        async function ivSubmitAnswer(answer) {
+            ivSetState('thinking', 'Evaluating your answer...');
+
+            try {
+                const res = await fetch('/api/interview/answer', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sessionId, answer })
+                });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.error);
+
+                // Show feedback in transcript
+                const cleanFeedback = data.evaluation.feedback.replace(/\[.*?\]/g, '').trim();
+                if (cleanFeedback) {
+                    ivAddLine('ai', cleanFeedback);
+                }
+
+                if (data.done) {
+                    // Interview finished (handled by cached audio so no hardcoded text needed)
+                    ivSetState('idle', 'Interview complete');
+                    ivPlayAudioSequence([data.feedbackCachedAudio, data.feedbackAudio, data.outroCachedAudio], null);
+                    document.getElementById('iv-report-section').classList.remove('hidden');
+                    document.getElementById('iv-report-content').innerHTML =
+                        data.finalReport.replace(/\n/g, '<br>');
+                } else {
+                    // Next question
+                    ivUpdateProgress(data.questionNumber, data.difficulty);
+                    ivAddLine('ai', data.nextQuestion);
+                    // Play prefix feedback + combined audio, then listen again
+                    ivPlayAudioSequence([data.feedbackCachedAudio, data.combinedAudio], () => ivStartListening());
+                }
+
+            } catch (err) {
+                document.getElementById('interview-status').textContent = 'Error: ' + err.message;
+                document.getElementById('interview-status').className = 'status-msg error-msg';
+                ivSetState('idle', 'Error occurred');
+            }
+        }
+
+        // ── Init speech recognition once ─────────────
+        (function initSpeech() {
+            const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+            if (!SR) { console.warn('Speech recognition not supported'); return; }
+            ivRecognition = new SR();
+            ivRecognition.continuous = true;
+            ivRecognition.interimResults = true;
+            ivRecognition.lang = 'en-US';
+        })();
+
+
 
     </script>
 </body>
