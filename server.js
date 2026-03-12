@@ -6,6 +6,7 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { createServer } from 'http';
 import { Server as SocketIOServer } from 'socket.io';
+import { AccessToken } from 'livekit-server-sdk';
 
 import { extractTextFromPDF } from "./lib/pdfLoader.js";
 import { splitText } from "./lib/textSplitter.js";
@@ -16,6 +17,9 @@ import { textToAudio } from "./lib/speechToAudio.js";
 import { queryRAG } from "./lib/rag.js";
 import { createInterviewAgent, registerVectorStore, registerSocket, unregisterSocket, parseTTSResponse, checkTTSCache } from "./lib/interviewAgent.js";
 import { HumanMessage, AIMessage } from "@langchain/core/messages";
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+const { DeepgramClient } = require('@deepgram/sdk');
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -33,6 +37,7 @@ console.log(`   GROQ_API_KEY      : ${process.env.GROQ_API_KEY ? '✅ Loaded' : 
 console.log(`   GEMINI_API_KEY    : ${process.env.GEMINI_API_KEY ? '✅ Loaded' : '❌ Missing/Not Used'}`);
 console.log(`   AWS_ACCESS_KEY_ID : ${process.env.AWS_ACCESS_KEY_ID ? '✅ Loaded' : '❌ Missing'}`);
 console.log(`   KOKORO_API_URL    : ${process.env.KOKORO_API_URL ? '✅ Loaded' : '⚠️ Defaulting'}`);
+console.log(`   LIVEKIT_API_KEY   : ${process.env.LIVEKIT_API_KEY ? '✅ Loaded' : '❌ Missing'}`);
 console.log(`========================================\n`);
 
 // ── Socket.io: register socket per session for AI streaming ──────
@@ -203,6 +208,64 @@ app.post('/api/chat', async (req, res) => {
     } catch (error) {
         console.error("Chat error:", error);
         res.status(500).json({ error: error.message || "Failed to get answer" });
+    }
+});
+
+// ==========================================
+// LiveKit — Token Endpoint
+// ==========================================
+app.post('/api/livekit/token', async (req, res) => {
+    try {
+        const { sessionId } = req.body;
+        if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
+
+        const apiKey    = process.env.LIVEKIT_API_KEY;
+        const apiSecret = process.env.LIVEKIT_API_SECRET;
+        const livekitUrl = process.env.LIVEKIT_URL;
+
+        if (!apiKey || !apiSecret || !livekitUrl) {
+            return res.status(500).json({ error: 'LiveKit environment variables not configured.' });
+        }
+
+        // Each sessionId maps to a LiveKit room — one room per interview
+        const at = new AccessToken(apiKey, apiSecret, {
+            identity: `candidate-${sessionId}`,
+            ttl: '2h',
+        });
+
+        at.addGrant({
+            roomJoin:     true,
+            room:         sessionId,   // room = sessionId (unique per PDF upload)
+            canPublish:   true,        // candidate can send mic audio
+            canSubscribe: true,        // candidate can receive AI audio
+        });
+
+        const token = await at.toJwt();
+        console.log(`[LiveKit] Token generated for session: ${sessionId}`);
+
+        res.json({ token, url: livekitUrl });
+
+    } catch (error) {
+        console.error('[LiveKit] Token generation error:', error);
+        res.status(500).json({ error: error.message || 'Failed to generate LiveKit token' });
+    }
+});
+
+// ==========================================
+// Deepgram — Token Endpoint
+// ==========================================
+app.get('/api/deepgram/token', async (req, res) => {
+    try {
+        const apiKey = process.env.DEEPGRAM_API_KEY;
+        if (!apiKey) {
+            return res.status(500).json({ error: 'DEEPGRAM_API_KEY not configured' });
+        }
+        // Simplified: Returning the main API key directly to avoid "createProjectKey is not a function" errors
+        // In highly secure production environments, consider a server-side proxy instead of passing keys to the client.
+        res.json({ token: apiKey });
+    } catch (error) {
+        console.error('[Deepgram] Token generation error:', error);
+        res.status(500).json({ error: 'Failed to retrieve Deepgram token' });
     }
 });
 

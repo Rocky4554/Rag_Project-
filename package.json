@@ -6,7 +6,7 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node index.js",
-    "dev": "node --watch index.js",
+    "dev": "nodemon server.js",
     "quiz": "node server.js"
   },
   "keywords": [],
@@ -16,6 +16,7 @@
   "dependencies": {
     "@aws-sdk/client-polly": "^3.1004.0",
     "@chroma-core/default-embed": "^0.1.9",
+    "@deepgram/sdk": "^5.0.0",
     "@google/generative-ai": "^0.24.1",
     "@langchain/community": "^1.1.20",
     "@langchain/core": "^1.1.29",
@@ -23,13 +24,16 @@
     "@langchain/groq": "^1.1.4",
     "@langchain/langgraph": "^1.2.1",
     "@langchain/openai": "^1.2.12",
+    "@livekit/agents": "^1.0.50",
     "chromadb": "^3.3.1",
     "cors": "^2.8.6",
     "dotenv": "^16.6.1",
     "express": "^5.2.1",
     "langchain": "^1.2.28",
+    "livekit-server-sdk": "^2.15.0",
     "multer": "^2.0.2",
-    "pdf-parse": "^1.1.1",
+    "nodemon": "^3.1.14",
+    "pdf-parse": "^1.1.4",
     "socket.io": "^4.8.3",
     "tslib": "^2.8.1"
   }

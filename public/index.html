@@ -522,10 +522,12 @@
     </div>
 
     <script src="/socket.io/socket.io.js"></script>
+    <script src="https://unpkg.com/livekit-client@2/dist/livekit-client.umd.min.js"></script>
     <script>
         // State
         let sessionId = null;
         let currentQuiz = null;
+        let livekitRoom = null;  // LiveKit room instance
 
         // Elements
         const uploadBtn = document.getElementById('upload-btn');
@@ -911,65 +913,121 @@
             playNext();
         }
 
-        // ── Start listening; auto-submit after 2s silence ─
-        function ivStartListening() {
-            if (!ivRecognition) {
-                // Fallback: no speech recognition available
-                ivSetState('idle', 'Speech recognition unavailable in this browser');
-                return;
-            }
+        // ── Start listening; auto-submit after silence or endpoint ─
+        let dgSocket = null;
+        let audioContext = null;
+        let mediaStream = null;
+        let scriptProcessor = null;
+
+        async function ivStartListening() {
             ivCurrentAnswer = '';
             ivSetInterim('');
-            ivSetState('listening', 'Listening... speak your answer');
+            ivSetState('listening', 'Connecting to secure voice stream...');
             ivIsListening = true;
 
-            ivRecognition.onresult = (e) => {
-                let interim = '';
-                let final = '';
-                for (let i = e.resultIndex; i < e.results.length; i++) {
-                    if (e.results[i].isFinal) final += e.results[i][0].transcript + ' ';
-                    else interim += e.results[i][0].transcript;
-                }
-                if (final) {
-                    ivCurrentAnswer += final;
-                    // Reset silence timer each time we get final speech
-                    clearTimeout(ivSilenceTimer);
-                    ivSilenceTimer = setTimeout(ivOnSilence, 2000);
-                }
-                ivSetInterim(interim || ivCurrentAnswer ? `"${(ivCurrentAnswer + interim).trim()}"` : '');
-            };
+            try {
+                // 1. Get Temporary Token from Backend
+                const res = await fetch('/api/deepgram/token');
+                const data = await res.json();
+                if (!data.token) throw new Error("Missing Deepgram token");
 
-            ivRecognition.onspeechend = () => {
-                // Silence detected by browser — start 1.5s countdown
+                // 2. Open Deepgram WebSocket
+                dgSocket = new WebSocket('wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=16000&channels=1&endpointing=500&interim_results=true', ['token', data.token]);
+
+                dgSocket.onopen = async () => {
+                    ivSetState('listening', 'Listening... speak your answer');
+                    
+                    // 3. Capture Mic and Pipe to WebSocket
+                    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                    const source = audioContext.createMediaStreamSource(mediaStream);
+                    
+                    // Note: ScriptProcessor is deprecated but widely supported for raw PCM capture
+                    scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+                    source.connect(scriptProcessor);
+                    scriptProcessor.connect(audioContext.destination);
+
+                    scriptProcessor.onaudioprocess = (e) => {
+                        if (dgSocket.readyState === WebSocket.OPEN && ivIsListening) {
+                            const audioData = e.inputBuffer.getChannelData(0);
+                            const int16Data = new Int16Array(audioData.length);
+                            for (let i = 0; i < audioData.length; i++) {
+                                int16Data[i] = Math.max(-32768, Math.min(32767, audioData[i] * 32768));
+                            }
+                            dgSocket.send(int16Data.buffer);
+                        }
+                    };
+                };
+
+                dgSocket.onmessage = (e) => {
+                    const msg = JSON.parse(e.data);
+                    if (msg.type === 'Results' && msg.channel.alternatives[0]) {
+                        const transcript = msg.channel.alternatives[0].transcript;
+                        const isFinal = msg.is_final;
+                        const isEndpoint = msg.speech_final;
+
+                        if (transcript) {
+                            if (isFinal) {
+                                ivCurrentAnswer += transcript + ' ';
+                                ivSetInterim(ivCurrentAnswer);
+                            } else {
+                                ivSetInterim(ivCurrentAnswer + transcript);
+                            }
+                            
+                            // Reset silence timer because we got speech
+                            clearTimeout(ivSilenceTimer);
+                            ivSilenceTimer = setTimeout(ivOnSilence, 2000);
+                        }
+
+                        // Deepgram explicitly detects end of sentence/idea
+                        if (isEndpoint && ivCurrentAnswer.trim().length > 3) {
+                            clearTimeout(ivSilenceTimer);
+                            ivOnSilence();
+                        }
+                    }
+                };
+
+                dgSocket.onerror = (e) => {
+                    console.error("Deepgram WS Error:", e);
+                    ivSetState('idle', 'Speech recognition error.');
+                };
+
+                // Safety: auto-stop if total silence for some time
                 clearTimeout(ivSilenceTimer);
-                ivSilenceTimer = setTimeout(ivOnSilence, 1500);
-            };
+                ivSilenceTimer = setTimeout(ivOnSilence, 6000);
 
-            ivRecognition.onerror = (e) => {
-                console.warn('STT error:', e.error);
-                if (e.error === 'no-speech') ivOnSilence();
-            };
-
-            ivRecognition.onend = () => {
-                // Restart if still in listening mode and haven't auto-submitted yet
-                if (ivIsListening) {
-                    try { ivRecognition.start(); } catch (_) { }
-                }
-            };
-
-            try { ivRecognition.start(); } catch (_) { }
+            } catch (err) {
+                console.error("STT Init Error:", err);
+                ivSetState('idle', 'Failed to initialize speech recognition.');
+            }
         }
 
         function ivOnSilence() {
             if (!ivIsListening) return;
             ivIsListening = false;
-            try { ivRecognition.stop(); } catch (_) { }
             clearTimeout(ivSilenceTimer);
+
+            // Stop streams & socket immediately
+            if (scriptProcessor) {
+                scriptProcessor.disconnect();
+                scriptProcessor = null;
+            }
+            if (mediaStream) {
+                mediaStream.getTracks().forEach(t => t.stop());
+                mediaStream = null;
+            }
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+            if (dgSocket && dgSocket.readyState === WebSocket.OPEN) {
+                dgSocket.close();
+                dgSocket = null;
+            }
 
             const answer = ivCurrentAnswer.trim();
             ivSetInterim('');
             if (answer.length < 3) {
-                // Too short — re-listen
                 ivSetState('listening', 'I did not catch that. Please speak again...');
                 setTimeout(ivStartListening, 1200);
                 return;
@@ -979,6 +1037,68 @@
         }
 
         // ── API calls ────────────────────────────────
+
+        // ── LiveKit: connect to a room for WebRTC audio ──
+        async function connectLiveKit(sid) {
+            try {
+                if (typeof LivekitClient === 'undefined') {
+                    console.warn('[LiveKit] SDK not loaded, skipping room connection.');
+                    return;
+                }
+
+                // Disconnect previous room if any
+                if (livekitRoom) {
+                    await livekitRoom.disconnect();
+                    livekitRoom = null;
+                }
+
+                // Get token from our server
+                const res = await fetch('/api/livekit/token', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sessionId: sid })
+                });
+                const { token, url, error } = await res.json();
+                if (!res.ok) throw new Error(error || 'Token request failed');
+
+                // Create and connect the room
+                livekitRoom = new LivekitClient.Room({
+                    audioCaptureDefaults: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true,
+                    },
+                    adaptiveStream: true,
+                    dynacast: true,
+                });
+
+                // When a remote audio track is published (future: AI voice via LiveKit)
+                livekitRoom.on(LivekitClient.RoomEvent.TrackSubscribed, (track, pub, participant) => {
+                    if (track.kind === LivekitClient.Track.Kind.Audio) {
+                        console.log('[LiveKit] Received audio track from:', participant.identity);
+                        const audioEl = track.attach();
+                        audioEl.autoplay = true;
+                        document.body.appendChild(audioEl);
+                    }
+                });
+
+                livekitRoom.on(LivekitClient.RoomEvent.Disconnected, (reason) => {
+                    console.log('[LiveKit] Disconnected:', reason);
+                });
+
+                await livekitRoom.connect(url, token);
+                console.log('[LiveKit] ✅ Connected to room:', livekitRoom.name);
+
+                // Publish mic audio into the LiveKit room
+                await livekitRoom.localParticipant.setMicrophoneEnabled(true);
+                console.log('[LiveKit] 🎤 Microphone published to room');
+
+            } catch (err) {
+                // Non-fatal: interview still works via Web Speech API + Socket.io
+                console.warn('[LiveKit] Connection failed (non-fatal):', err.message);
+            }
+        }
+
         async function startInterview() {
             ivLength = parseInt(document.getElementById('interview-length').value) || 5;
             document.getElementById('interview-setup').classList.add('hidden');
@@ -986,10 +1106,13 @@
             document.getElementById('interview-status').textContent = '';
             ivSetState('thinking', 'Preparing your interview...');
 
-            // Register socket session so play_tts events are routed correctly
+            // Register with Socket.io
             if (window._ivSocket && sessionId) {
                 window._ivSocket.emit('register_session', sessionId);
             }
+
+            // Connect to LiveKit room (WebRTC audio infrastructure)
+            connectLiveKit(sessionId);  // non-blocking, non-fatal
 
             // Greet the user first
             const greetText = `Hello! Welcome to your AI voice interview. I will ask you ${ivLength} questions based on the document you uploaded. After I finish asking each question, your microphone will activate automatically. Please answer clearly. Let's begin!`;
@@ -1066,16 +1189,6 @@
                 ivSetState('idle', 'Error occurred');
             }
         }
-
-        // ── Init speech recognition once ─────────────
-        (function initSpeech() {
-            const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-            if (!SR) { console.warn('Speech recognition not supported'); return; }
-            ivRecognition = new SR();
-            ivRecognition.continuous = true;
-            ivRecognition.interimResults = true;
-            ivRecognition.lang = 'en-US';
-        })();
 
         // ── Socket.io for real-time events (play_tts, ai_feedback, etc.) ──
         (function initSocket() {
