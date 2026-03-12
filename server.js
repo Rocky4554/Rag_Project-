@@ -57,7 +57,6 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Set up multer for PDF uploads
-// Create uploads dir if it doesn't exist
 const uploadDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) {
     fs.mkdirSync(uploadDir);
@@ -68,7 +67,6 @@ const storage = multer.diskStorage({
         cb(null, 'uploads/')
     },
     filename: function (req, file, cb) {
-        // Keep original extension, add timestamp to avoid collisions
         const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
         cb(null, uniqueSuffix + path.extname(file.originalname))
     }
@@ -85,8 +83,6 @@ const upload = multer({
     }
 });
 
-// In-memory store mapping session IDs to vector stores
-// In a real app, you'd probably use a real DB or re-initialize vector stores from ChromaDB by collection name
 const sessionCache = {};
 
 // Routes
@@ -99,14 +95,10 @@ app.post('/api/upload', upload.single('pdf'), async (req, res) => {
         console.log(`Received file: ${req.file.filename}`);
         const sessionId = req.file.filename;
 
-        // Process the PDF
         const text = await extractTextFromPDF(req.file.path);
         const docs = await splitText(text);
-
-        // Use the filename as a unique collection name for this user's PDF
         const vectorStore = await storeDocuments(docs, sessionId);
 
-        // Cache the vector store, raw docs, and an empty chat history array
         sessionCache[sessionId] = {
             vectorStore: vectorStore,
             docs: docs,
@@ -139,7 +131,6 @@ app.post('/api/quiz', async (req, res) => {
         }
         const vectorStore = session.vectorStore;
 
-        // Generate the quiz
         const quizData = await generateQuiz(vectorStore, {
             topic: topic || "general",
             numQuestions: parseInt(numQuestions) || 5
@@ -198,14 +189,11 @@ app.post('/api/chat', async (req, res) => {
 
         console.log(`Chat request: "${question}" for session: ${sessionId}`);
 
-        // Use the stored history to understand follow-up questions
         const answer = await queryRAG(session.vectorStore, question, session.chatHistory);
 
-        // Save this exchange to the session's memory for the next follow-up question
         session.chatHistory.push(new HumanMessage(question));
         session.chatHistory.push(new AIMessage(answer));
 
-        // Limit history to last 10 exchanges (20 messages) to prevent context bloat
         if (session.chatHistory.length > 20) {
             session.chatHistory = session.chatHistory.slice(session.chatHistory.length - 20);
         }
@@ -236,10 +224,8 @@ app.post('/api/interview/start', async (req, res) => {
 
         console.log(`Starting interview for session: ${sessionId}`);
 
-        // Register the vectorStore in the module-level registry (NOT in graph state - it can't be serialized)
         registerVectorStore(sessionId, session.vectorStore);
 
-        // Initial state — no vectorStore here
         const initialState = {
             sessionId: sessionId,
             maxQuestions: parseInt(maxQuestions),
@@ -249,36 +235,45 @@ app.post('/api/interview/start', async (req, res) => {
             topicsUsed: []
         };
 
-        // Run the graph — it pauses at END after generateQuestionNode
         const config = { configurable: { thread_id: sessionId } };
         const resultState = await interviewAgent.invoke(initialState, config);
 
-        // Save the graph state back to our session cache
-        session.interviewStateConfig = config; // Keep track of the thread ID
+        session.interviewStateConfig = config;
 
-        console.log(`Converting question to audio...`);
+        console.log(`🔍 FIRST QUESTION GENERATED: "${resultState.currentQuestion}"`);
+
+        // ═══════════════════════════════════════════════════════════════
+        // CRITICAL FIX: Parse the question tag properly
+        // Agent generates: "[interview_intro] What is a linked list?"
+        // We should: play interview_intro.mp3 + TTS("What is a linked list?")
+        // ═══════════════════════════════════════════════════════════════
         const { phraseKey, uniquePart } = parseTTSResponse(resultState.currentQuestion);
 
+        console.log(`🔍 PARSED: phraseKey="${phraseKey}", uniquePart="${uniquePart}"`);
+
+        // Build audio response
         let introCachedAudio = null;
-        const introFile = checkTTSCache("interview_intro");
-        if (introFile) {
-            console.log(`[TTS] Cache hit for intro: interview_intro`);
-            introCachedAudio = fs.readFileSync(introFile).toString('base64');
+        let questionAudio = null;
+
+        // If there's a tag in the question (like interview_intro or next_question)
+        if (phraseKey) {
+            const cachedFile = checkTTSCache(phraseKey);
+            if (cachedFile) {
+                console.log(`[TTS] Cache hit for question tag: ${phraseKey}`);
+                introCachedAudio = fs.readFileSync(cachedFile).toString('base64');
+            }
         }
-        let questionAudio;
-        const cachedFile = phraseKey ? checkTTSCache(phraseKey) : null;
-        if (cachedFile) {
-            // Serve the pre-generated cache file as base64
-            const buf = fs.readFileSync(cachedFile);
-            questionAudio = { audio: buf.toString('base64'), format: 'mp3' };
-            console.log(`[TTS] Cache hit: ${phraseKey}`);
-        } else {
-            questionAudio = await textToAudio(uniquePart);
+
+        // Generate TTS for the unique part of the question (without the tag)
+        if (uniquePart && uniquePart.trim().length > 0) {
+            console.log(`[TTS] Generating speech for question: "${uniquePart}"`);
+            const ttsResult = await textToAudio(uniquePart);
+            questionAudio = ttsResult?.audio ?? ttsResult;
         }
 
         res.json({
             question: uniquePart,
-            audio: questionAudio?.audio ?? questionAudio,
+            audio: questionAudio,
             feedbackCachedAudio: introCachedAudio, // Frontend plays this first!
             questionNumber: resultState.questionsAsked,
             difficulty: resultState.difficultyLevel
@@ -301,14 +296,9 @@ app.post('/api/interview/answer', async (req, res) => {
         }
 
         console.log(`Processing interview answer for session: ${sessionId}`);
+        console.log(`🔍 USER SAID: "${answer}"`);
 
-        // Provide the user's answer into the state
-        const inputState = {
-            userAnswer: answer
-        };
-
-        // Resume the graph from where it paused.
-        // It will run evaluateAnswer -> adaptNextQuestion -> (generateQuestion OR generateFinalReport) -> END
+        const inputState = { userAnswer: answer };
         const resultState = await interviewAgent.invoke(inputState, session.interviewStateConfig);
 
         let finalReport = null;
@@ -320,65 +310,124 @@ app.post('/api/interview/answer', async (req, res) => {
             }
         };
 
+        console.log(`🔍 EVALUATION FEEDBACK: "${responsePayload.evaluation.feedback}"`);
+
         if (resultState.finalReport) {
-            // Interview is over! Return the report and the evaluation of the last answer.
+            // ═══════════════════════════════════════════════════════════════
+            // INTERVIEW IS OVER
+            // ═══════════════════════════════════════════════════════════════
             finalReport = resultState.finalReport;
             responsePayload.done = true;
             responsePayload.finalReport = finalReport;
 
-            const { phraseKey: lastFbKey, uniquePart: lastFbClean } = parseTTSResponse(responsePayload.evaluation.feedback);
+            const { phraseKeys, uniquePart: lastFbClean } = parseTTSResponse(responsePayload.evaluation.feedback);
+            console.log(`🔍 FINAL FEEDBACK - phraseKeys=${JSON.stringify(phraseKeys)}, uniquePart="${lastFbClean}"`);
             console.log(`Converting final feedback to audio...`);
 
+            // Build array of cached audio files to play in sequence
+            let cachedAudioSequence = [];
+
+            // Add all cached phrases from feedback (e.g., [thats_okay] [thanks_for_time])
+            if (phraseKeys && phraseKeys.length > 0) {
+                for (const key of phraseKeys) {
+                    const fbFile = checkTTSCache(key);
+                    if (fbFile) {
+                        console.log(`[TTS] Cache hit for final feedback phrase: ${key}`);
+                        cachedAudioSequence.push({
+                            key: key,
+                            audio: fs.readFileSync(fbFile).toString('base64')
+                        });
+                    }
+                }
+            }
+
+            // Generate TTS for unique part if exists
             let feedbackAudio = null;
-            if (lastFbClean.trim().length > 0) {
+            if (lastFbClean && lastFbClean.trim().length > 0) {
                 const rawAudio = await textToAudio(lastFbClean);
                 feedbackAudio = rawAudio?.audio ?? rawAudio;
             }
 
-            let feedbackCachedAudio = null;
-            if (lastFbKey) {
-                const fbFile = checkTTSCache(lastFbKey);
-                if (fbFile) {
-                    console.log(`[TTS] Cache hit for final feedback phrase: ${lastFbKey}`);
-                    feedbackCachedAudio = fs.readFileSync(fbFile).toString('base64');
-                }
-            }
-
-            let outroCachedAudio = null;
+            // Add outro at the end
             const outroFile = checkTTSCache("interview_outro");
             if (outroFile) {
                 console.log(`[TTS] Cache hit for outro: interview_outro`);
-                outroCachedAudio = fs.readFileSync(outroFile).toString('base64');
+                cachedAudioSequence.push({
+                    key: "interview_outro",
+                    audio: fs.readFileSync(outroFile).toString('base64')
+                });
             }
 
-            responsePayload.feedbackCachedAudio = feedbackCachedAudio;
+            // Return sequence: [cached1, cached2, ...] → unique TTS → outro
+            responsePayload.cachedAudioSequence = cachedAudioSequence;
             responsePayload.feedbackAudio = feedbackAudio;
-            responsePayload.outroCachedAudio = outroCachedAudio; // Frontend plays feedbackCached -> feedback -> outro
         } else {
-            // Interview continues. Return evaluation + next question
+            // ═══════════════════════════════════════════════════════════════
+            // INTERVIEW CONTINUES
+            // ═══════════════════════════════════════════════════════════════
             responsePayload.done = false;
             responsePayload.nextQuestion = resultState.currentQuestion;
             responsePayload.questionNumber = resultState.questionsAsked;
             responsePayload.difficulty = resultState.difficultyLevel;
 
-            // ── Build TTS for feedback (use cache for prefix phrase if available) ──
-            const { phraseKey: fbKey, uniquePart: fbUnique } = parseTTSResponse(responsePayload.evaluation.feedback);
-            const fbCachedFile = fbKey ? checkTTSCache(fbKey) : null;
+            console.log(`🔍 NEXT QUESTION: "${resultState.currentQuestion}"`);
 
-            // ── Strip tag from question text before TTS ──
-            const { uniquePart: questionSpoken } = parseTTSResponse(resultState.currentQuestion);
+            // ── Parse feedback (should have NO tags for normal evaluation) ──
+            const { phraseKey: fbKey, uniquePart: fbUnique } = parseTTSResponse(responsePayload.evaluation.feedback);
+
+            console.log(`🔍 FEEDBACK - phraseKey="${fbKey}", uniquePart="${fbUnique}"`);
+
+            // ── Parse next question (may have [next_question] or [final_question] tag) ──
+            const { phraseKey: qKey, uniquePart: questionSpoken } = parseTTSResponse(resultState.currentQuestion);
+
+            console.log(`🔍 QUESTION - phraseKey="${qKey}", uniquePart="${questionSpoken}"`);
+
             responsePayload.nextQuestion = questionSpoken;
 
-            const spokenText = fbUnique + " " + questionSpoken;
-            console.log(`Converting feedback and next question to audio...`);
-            const ttsAudio = await textToAudio(spokenText);
+            // ── Build audio ──
+            let feedbackCachedAudio = null;
+            let questionCachedAudio = null;
+            let combinedTextForTTS = "";
 
-            if (fbCachedFile) {
-                console.log(`[TTS] Cache hit for feedback phrase: ${fbKey}`);
-                const buf = fs.readFileSync(fbCachedFile);
-                responsePayload.feedbackCachedAudio = buf.toString('base64');
+            // FEEDBACK: Check for cached phrase (edge cases only)
+            if (fbKey) {
+                const fbCachedFile = checkTTSCache(fbKey);
+                if (fbCachedFile) {
+                    console.log(`[TTS] Cache hit for feedback: ${fbKey}`);
+                    feedbackCachedAudio = fs.readFileSync(fbCachedFile).toString('base64');
+                }
             }
-            responsePayload.combinedAudio = ttsAudio?.audio ?? ttsAudio;
+
+            // FEEDBACK: Add unique part to TTS if exists
+            if (fbUnique && fbUnique.trim().length > 0) {
+                combinedTextForTTS += fbUnique + " ";
+            }
+
+            // QUESTION: Check for cached transition phrase
+            if (qKey) {
+                const qCachedFile = checkTTSCache(qKey);
+                if (qCachedFile) {
+                    console.log(`[TTS] Cache hit for question transition: ${qKey}`);
+                    questionCachedAudio = fs.readFileSync(qCachedFile).toString('base64');
+                }
+            }
+
+            // QUESTION: Add unique part to TTS
+            if (questionSpoken && questionSpoken.trim().length > 0) {
+                combinedTextForTTS += questionSpoken;
+            }
+
+            // Generate TTS for combined text
+            let combinedAudio = null;
+            if (combinedTextForTTS.trim().length > 0) {
+                console.log(`[TTS] Generating speech for: "${combinedTextForTTS}"`);
+                const ttsResult = await textToAudio(combinedTextForTTS.trim());
+                combinedAudio = ttsResult?.audio ?? ttsResult;
+            }
+
+            responsePayload.feedbackCachedAudio = feedbackCachedAudio;
+            responsePayload.questionCachedAudio = questionCachedAudio;
+            responsePayload.combinedAudio = combinedAudio;
         }
 
         res.json(responsePayload);

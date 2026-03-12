@@ -521,6 +521,7 @@
 
     </div>
 
+    <script src="/socket.io/socket.io.js"></script>
     <script>
         // State
         let sessionId = null;
@@ -985,6 +986,11 @@
             document.getElementById('interview-status').textContent = '';
             ivSetState('thinking', 'Preparing your interview...');
 
+            // Register socket session so play_tts events are routed correctly
+            if (window._ivSocket && sessionId) {
+                window._ivSocket.emit('register_session', sessionId);
+            }
+
             // Greet the user first
             const greetText = `Hello! Welcome to your AI voice interview. I will ask you ${ivLength} questions based on the document you uploaded. After I finish asking each question, your microphone will activate automatically. Please answer clearly. Let's begin!`;
             ivAddLine('ai', greetText);
@@ -1031,18 +1037,27 @@
                 }
 
                 if (data.done) {
-                    // Interview finished (handled by cached audio so no hardcoded text needed)
+                    // ── Interview finished ──
                     ivSetState('idle', 'Interview complete');
-                    ivPlayAudioSequence([data.feedbackCachedAudio, data.feedbackAudio, data.outroCachedAudio], null);
+                    // cachedAudioSequence is [{key, audio}, ...] from server
+                    const seqAudios = (data.cachedAudioSequence || []).map(item => item.audio).filter(Boolean);
+                    const allDoneAudio = [...seqAudios, data.feedbackAudio].filter(Boolean);
+                    ivPlayAudioSequence(allDoneAudio, null);
                     document.getElementById('iv-report-section').classList.remove('hidden');
                     document.getElementById('iv-report-content').innerHTML =
                         data.finalReport.replace(/\n/g, '<br>');
                 } else {
-                    // Next question
+                    // ── Next question ──
                     ivUpdateProgress(data.questionNumber, data.difficulty);
                     ivAddLine('ai', data.nextQuestion);
-                    // Play prefix feedback + combined audio, then listen again
-                    ivPlayAudioSequence([data.feedbackCachedAudio, data.combinedAudio], () => ivStartListening());
+                    // Sequence: [feedbackCached, questionCached, combinedAudio(feedback+question TTS)]
+                    // feedbackCachedAudio = quality tag (great_answer / good_effort / interesting / thats_okay etc)
+                    // questionCachedAudio = transition phrase (next_question / final_question)
+                    // combinedAudio      = spoken feedback text + spoken question text (Polly TTS)
+                    ivPlayAudioSequence(
+                        [data.feedbackCachedAudio, data.questionCachedAudio, data.combinedAudio].filter(Boolean),
+                        () => ivStartListening()
+                    );
                 }
 
             } catch (err) {
@@ -1062,7 +1077,37 @@
             ivRecognition.lang = 'en-US';
         })();
 
+        // ── Socket.io for real-time events (play_tts, ai_feedback, etc.) ──
+        (function initSocket() {
+            if (typeof io === 'undefined') {
+                console.warn('[Socket] Socket.io not loaded — real-time audio events disabled.');
+                return;
+            }
+            const socket = io();
+            window._ivSocket = socket;
 
+            socket.on('connect', () => {
+                // Re-register session if interview already started
+                if (sessionId) socket.emit('register_session', sessionId);
+                console.log('[Socket] Connected:', socket.id);
+            });
+
+            // ── play_tts: backend emits this immediately for stop/unwell intent ──
+            socket.on('play_tts', ({ key, audio }) => {
+                console.log('[Socket] play_tts received for key:', key);
+                if (audio) {
+                    ivAudio.pause();
+                    ivAudio.src = `data:audio/mp3;base64,${audio}`;
+                    ivSetState('speaking', 'AI Speaking...');
+                    ivAudio.play().catch(() => {});
+                }
+            });
+
+            // ── ai_feedback: real-time score/quality event ──
+            socket.on('ai_feedback', ({ score, answerQuality }) => {
+                console.log(`[Socket] ai_feedback: quality=${answerQuality}, score=${score}`);
+            });
+        })();
 
     </script>
 </body>
