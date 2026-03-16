@@ -528,6 +528,7 @@
         let sessionId = null;
         let currentQuiz = null;
         let livekitRoom = null;  // LiveKit room instance
+        let livekitAudioEl = null; // persistent audio sink for remote AI track
 
         // Elements
         const uploadBtn = document.getElementById('upload-btn');
@@ -880,160 +881,17 @@
         }
 
         function ivPlayAudioSequence(base64Array, callback) {
-            const validAudios = base64Array.filter(Boolean);
-            if (validAudios.length === 0) {
-                if (callback) callback();
-                return;
-            }
-
-            let currentIndex = 0;
-
-            function playNext() {
-                if (currentIndex >= validAudios.length) {
-                    if (callback) callback();
-                    return;
-                }
-
-                ivSetState('speaking', 'AI Speaking...');
-                ivAudio.src = `data:audio/mp3;base64,${validAudios[currentIndex]}`;
-                ivAudio.onended = () => {
-                    currentIndex++;
-                    playNext();
-                };
-                ivAudio.onerror = () => {
-                    currentIndex++;
-                    playNext();
-                };
-                ivAudio.play().catch(() => {
-                    currentIndex++;
-                    playNext();
-                });
-            }
-
-            playNext();
+            // Disabled in WebRTC mode - audio comes through LiveKit track
+            if (callback) callback();
         }
 
         // ── Start listening; auto-submit after silence or endpoint ─
-        let dgSocket = null;
-        let audioContext = null;
-        let mediaStream = null;
-        let scriptProcessor = null;
-
         async function ivStartListening() {
-            ivCurrentAnswer = '';
-            ivSetInterim('');
-            ivSetState('listening', 'Connecting to secure voice stream...');
-            ivIsListening = true;
-
-            try {
-                // 1. Get Temporary Token from Backend
-                const res = await fetch('/api/deepgram/token');
-                const data = await res.json();
-                if (!data.token) throw new Error("Missing Deepgram token");
-
-                // 2. Open Deepgram WebSocket
-                dgSocket = new WebSocket('wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=16000&channels=1&endpointing=500&interim_results=true', ['token', data.token]);
-
-                dgSocket.onopen = async () => {
-                    ivSetState('listening', 'Listening... speak your answer');
-                    
-                    // 3. Capture Mic and Pipe to WebSocket
-                    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
-                    audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-                    const source = audioContext.createMediaStreamSource(mediaStream);
-                    
-                    // Note: ScriptProcessor is deprecated but widely supported for raw PCM capture
-                    scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
-                    source.connect(scriptProcessor);
-                    scriptProcessor.connect(audioContext.destination);
-
-                    scriptProcessor.onaudioprocess = (e) => {
-                        if (dgSocket.readyState === WebSocket.OPEN && ivIsListening) {
-                            const audioData = e.inputBuffer.getChannelData(0);
-                            const int16Data = new Int16Array(audioData.length);
-                            for (let i = 0; i < audioData.length; i++) {
-                                int16Data[i] = Math.max(-32768, Math.min(32767, audioData[i] * 32768));
-                            }
-                            dgSocket.send(int16Data.buffer);
-                        }
-                    };
-                };
-
-                dgSocket.onmessage = (e) => {
-                    const msg = JSON.parse(e.data);
-                    if (msg.type === 'Results' && msg.channel.alternatives[0]) {
-                        const transcript = msg.channel.alternatives[0].transcript;
-                        const isFinal = msg.is_final;
-                        const isEndpoint = msg.speech_final;
-
-                        if (transcript) {
-                            if (isFinal) {
-                                ivCurrentAnswer += transcript + ' ';
-                                ivSetInterim(ivCurrentAnswer);
-                            } else {
-                                ivSetInterim(ivCurrentAnswer + transcript);
-                            }
-                            
-                            // Reset silence timer because we got speech
-                            clearTimeout(ivSilenceTimer);
-                            ivSilenceTimer = setTimeout(ivOnSilence, 2000);
-                        }
-
-                        // Deepgram explicitly detects end of sentence/idea
-                        if (isEndpoint && ivCurrentAnswer.trim().length > 3) {
-                            clearTimeout(ivSilenceTimer);
-                            ivOnSilence();
-                        }
-                    }
-                };
-
-                dgSocket.onerror = (e) => {
-                    console.error("Deepgram WS Error:", e);
-                    ivSetState('idle', 'Speech recognition error.');
-                };
-
-                // Safety: auto-stop if total silence for some time
-                clearTimeout(ivSilenceTimer);
-                ivSilenceTimer = setTimeout(ivOnSilence, 6000);
-
-            } catch (err) {
-                console.error("STT Init Error:", err);
-                ivSetState('idle', 'Failed to initialize speech recognition.');
-            }
+            // No-op for WebRTC agent flow. LiveKit track pushes automatically.
         }
 
         function ivOnSilence() {
-            if (!ivIsListening) return;
-            ivIsListening = false;
-            clearTimeout(ivSilenceTimer);
-
-            // Stop streams & socket immediately
-            if (scriptProcessor) {
-                scriptProcessor.disconnect();
-                scriptProcessor = null;
-            }
-            if (mediaStream) {
-                mediaStream.getTracks().forEach(t => t.stop());
-                mediaStream = null;
-            }
-            if (audioContext) {
-                audioContext.close();
-                audioContext = null;
-            }
-            if (dgSocket && dgSocket.readyState === WebSocket.OPEN) {
-                dgSocket.close();
-                dgSocket = null;
-            }
-
-            const answer = ivCurrentAnswer.trim();
-            ivSetInterim('');
-            if (answer.length < 3) {
-                ivSetState('listening', 'I did not catch that. Please speak again...');
-                setTimeout(ivStartListening, 1200);
-                return;
-            }
-            ivAddLine('user', answer);
-            ivSubmitAnswer(answer);
+            // Handled server-side now.
         }
 
         // ── API calls ────────────────────────────────
@@ -1072,13 +930,26 @@
                     dynacast: true,
                 });
 
-                // When a remote audio track is published (future: AI voice via LiveKit)
+                // Create one persistent audio sink to avoid autoplay/race issues.
+                if (!livekitAudioEl) {
+                    livekitAudioEl = document.createElement('audio');
+                    livekitAudioEl.autoplay = true;
+                    livekitAudioEl.playsInline = true;
+                    livekitAudioEl.style.display = 'none';
+                    document.body.appendChild(livekitAudioEl);
+                }
+
+                // When a remote audio track is published (AI voice via LiveKit)
                 livekitRoom.on(LivekitClient.RoomEvent.TrackSubscribed, (track, pub, participant) => {
                     if (track.kind === LivekitClient.Track.Kind.Audio) {
                         console.log('[LiveKit] Received audio track from:', participant.identity);
-                        const audioEl = track.attach();
-                        audioEl.autoplay = true;
-                        document.body.appendChild(audioEl);
+                        track.attach(livekitAudioEl);
+                        const playPromise = livekitAudioEl.play();
+                        if (playPromise && typeof playPromise.catch === 'function') {
+                            playPromise.catch((err) => {
+                                console.warn('[LiveKit] Audio autoplay blocked:', err?.message || err);
+                            });
+                        }
                     }
                 });
 
@@ -1112,12 +983,9 @@
             }
 
             // Connect to LiveKit room (WebRTC audio infrastructure)
-            connectLiveKit(sessionId);  // non-blocking, non-fatal
+            await connectLiveKit(sessionId);
 
-            // Greet the user first
-            const greetText = `Hello! Welcome to your AI voice interview. I will ask you ${ivLength} questions based on the document you uploaded. After I finish asking each question, your microphone will activate automatically. Please answer clearly. Let's begin!`;
-            ivAddLine('ai', greetText);
-
+            // Tell backend to start the agent worker
             try {
                 const res = await fetch('/api/interview/start', {
                     method: 'POST',
@@ -1128,10 +996,7 @@
                 if (!res.ok) throw new Error(data.error);
 
                 ivUpdateProgress(data.questionNumber, data.difficulty);
-                ivAddLine('ai', data.question);
-
-                // Speak greeting + question, then start mic
-                ivPlayAudioSequence([data.feedbackCachedAudio, data.audio], () => ivStartListening());
+                // The backend worker will now speak the first question directly over LiveKit
 
             } catch (err) {
                 document.getElementById('interview-status').textContent = err.message;
@@ -1142,52 +1007,8 @@
         }
 
         async function ivSubmitAnswer(answer) {
-            ivSetState('thinking', 'Evaluating your answer...');
-
-            try {
-                const res = await fetch('/api/interview/answer', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ sessionId, answer })
-                });
-                const data = await res.json();
-                if (!res.ok) throw new Error(data.error);
-
-                // Show feedback in transcript
-                const cleanFeedback = data.evaluation.feedback.replace(/\[.*?\]/g, '').trim();
-                if (cleanFeedback) {
-                    ivAddLine('ai', cleanFeedback);
-                }
-
-                if (data.done) {
-                    // ── Interview finished ──
-                    ivSetState('idle', 'Interview complete');
-                    // cachedAudioSequence is [{key, audio}, ...] from server
-                    const seqAudios = (data.cachedAudioSequence || []).map(item => item.audio).filter(Boolean);
-                    const allDoneAudio = [...seqAudios, data.feedbackAudio].filter(Boolean);
-                    ivPlayAudioSequence(allDoneAudio, null);
-                    document.getElementById('iv-report-section').classList.remove('hidden');
-                    document.getElementById('iv-report-content').innerHTML =
-                        data.finalReport.replace(/\n/g, '<br>');
-                } else {
-                    // ── Next question ──
-                    ivUpdateProgress(data.questionNumber, data.difficulty);
-                    ivAddLine('ai', data.nextQuestion);
-                    // Sequence: [feedbackCached, questionCached, combinedAudio(feedback+question TTS)]
-                    // feedbackCachedAudio = quality tag (great_answer / good_effort / interesting / thats_okay etc)
-                    // questionCachedAudio = transition phrase (next_question / final_question)
-                    // combinedAudio      = spoken feedback text + spoken question text (Polly TTS)
-                    ivPlayAudioSequence(
-                        [data.feedbackCachedAudio, data.questionCachedAudio, data.combinedAudio].filter(Boolean),
-                        () => ivStartListening()
-                    );
-                }
-
-            } catch (err) {
-                document.getElementById('interview-status').textContent = 'Error: ' + err.message;
-                document.getElementById('interview-status').className = 'status-msg error-msg';
-                ivSetState('idle', 'Error occurred');
-            }
+            // No longer used directly from frontend.
+            // STT in the background agent processes speech and calls processUserTranscript
         }
 
         // ── Socket.io for real-time events (play_tts, ai_feedback, etc.) ──
@@ -1205,15 +1026,24 @@
                 console.log('[Socket] Connected:', socket.id);
             });
 
-            // ── play_tts: backend emits this immediately for stop/unwell intent ──
+            // ── play_tts: disabled, agent plays audio natively ──
             socket.on('play_tts', ({ key, audio }) => {
-                console.log('[Socket] play_tts received for key:', key);
-                if (audio) {
-                    ivAudio.pause();
-                    ivAudio.src = `data:audio/mp3;base64,${audio}`;
-                    ivSetState('speaking', 'AI Speaking...');
-                    ivAudio.play().catch(() => {});
-                }
+                console.log('[Socket] play_tts event received but agent handles audio now');
+            });
+
+            // ── real-time states from agent ──
+            socket.on('ai_state', ({ state, text }) => {
+                ivSetState(state, text);
+            });
+
+            socket.on('transcript_final', ({ role, text }) => {
+                ivAddLine(role, text);
+            });
+
+            socket.on('interview_done', ({ report }) => {
+                ivSetState('idle', 'Interview complete');
+                document.getElementById('iv-report-section').classList.remove('hidden');
+                document.getElementById('iv-report-content').innerHTML = report.replace(/\n/g, '<br>');
             });
 
             // ── ai_feedback: real-time score/quality event ──

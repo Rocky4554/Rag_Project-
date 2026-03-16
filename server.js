@@ -4,6 +4,7 @@ import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import { createRequire } from 'module';
 import { createServer } from 'http';
 import { Server as SocketIOServer } from 'socket.io';
 import { AccessToken } from 'livekit-server-sdk';
@@ -17,7 +18,10 @@ import { textToAudio } from "./lib/speechToAudio.js";
 import { queryRAG } from "./lib/rag.js";
 import { createInterviewAgent, registerVectorStore, registerSocket, unregisterSocket, parseTTSResponse, checkTTSCache } from "./lib/interviewAgent.js";
 import { HumanMessage, AIMessage } from "@langchain/core/messages";
-import { createRequire } from 'module';
+import { InterviewAgentWorker } from "./agent/agent.js";
+
+// Global map to hold active agents
+const activeAgents = new Map();
 const require = createRequire(import.meta.url);
 const { DeepgramClient } = require('@deepgram/sdk');
 
@@ -38,6 +42,8 @@ console.log(`   GEMINI_API_KEY    : ${process.env.GEMINI_API_KEY ? '✅ Loaded' 
 console.log(`   AWS_ACCESS_KEY_ID : ${process.env.AWS_ACCESS_KEY_ID ? '✅ Loaded' : '❌ Missing'}`);
 console.log(`   KOKORO_API_URL    : ${process.env.KOKORO_API_URL ? '✅ Loaded' : '⚠️ Defaulting'}`);
 console.log(`   LIVEKIT_API_KEY   : ${process.env.LIVEKIT_API_KEY ? '✅ Loaded' : '❌ Missing'}`);
+console.log(`   QDRANT_URL        : ${process.env.QDRANT_URL ? '✅ Loaded' : '❌ Missing'}`);
+console.log(`   QDRANT_API_KEY    : ${process.env.QDRANT_API_KEY ? '✅ Loaded' : '❌ Missing'}`);
 console.log(`========================================\n`);
 
 // ── Socket.io: register socket per session for AI streaming ──────
@@ -46,12 +52,17 @@ io.on('connection', (socket) => {
 
     socket.on('register_session', (sessionId) => {
         if (sessionId) {
+            socket.join(sessionId);
+            socket.data.sessionId = sessionId;
             registerSocket(sessionId, socket);
             console.log(`[Socket.io] Socket ${socket.id} registered for session: ${sessionId}`);
         }
     });
 
     socket.on('disconnect', () => {
+        if (socket.data.sessionId) {
+            unregisterSocket(socket.data.sessionId);
+        }
         console.log(`[Socket.io] Client disconnected: ${socket.id}`);
     });
 });
@@ -260,9 +271,29 @@ app.get('/api/deepgram/token', async (req, res) => {
         if (!apiKey) {
             return res.status(500).json({ error: 'DEEPGRAM_API_KEY not configured' });
         }
-        // Simplified: Returning the main API key directly to avoid "createProjectKey is not a function" errors
-        // In highly secure production environments, consider a server-side proxy instead of passing keys to the client.
-        res.json({ token: apiKey });
+
+        // STT runtime options (configurable from .env)
+        const model = process.env.DEEPGRAM_STT_MODEL || 'nova-3';
+        const language = process.env.DEEPGRAM_STT_LANGUAGE || 'en';
+        const smartFormat = (process.env.DEEPGRAM_STT_SMART_FORMAT || 'true').toLowerCase() === 'true';
+        const interimResults = (process.env.DEEPGRAM_STT_INTERIM_RESULTS || 'true').toLowerCase() === 'true';
+        const endpointing = parseInt(process.env.DEEPGRAM_STT_ENDPOINTING_MS || '500', 10);
+
+        // Simplified: returns API key as token for browser websocket auth.
+        // For stricter production security, replace with short-lived project keys/proxy.
+        res.json({
+            token: apiKey,
+            stt: {
+                model,
+                language,
+                smart_format: smartFormat,
+                interim_results: interimResults,
+                endpointing: Number.isFinite(endpointing) ? endpointing : 500,
+                encoding: 'linear16',
+                sample_rate: 16000,
+                channels: 1
+            }
+        });
     } catch (error) {
         console.error('[Deepgram] Token generation error:', error);
         res.status(500).json({ error: 'Failed to retrieve Deepgram token' });
@@ -303,43 +334,30 @@ app.post('/api/interview/start', async (req, res) => {
 
         session.interviewStateConfig = config;
 
-        console.log(`🔍 FIRST QUESTION GENERATED: "${resultState.currentQuestion}"`);
-
-        // ═══════════════════════════════════════════════════════════════
-        // CRITICAL FIX: Parse the question tag properly
-        // Agent generates: "[interview_intro] What is a linked list?"
-        // We should: play interview_intro.mp3 + TTS("What is a linked list?")
-        // ═══════════════════════════════════════════════════════════════
-        const { phraseKey, uniquePart } = parseTTSResponse(resultState.currentQuestion);
-
-        console.log(`🔍 PARSED: phraseKey="${phraseKey}", uniquePart="${uniquePart}"`);
-
-        // Build audio response
-        let introCachedAudio = null;
-        let questionAudio = null;
-
-        // If there's a tag in the question (like interview_intro or next_question)
-        if (phraseKey) {
-            const cachedFile = checkTTSCache(phraseKey);
-            if (cachedFile) {
-                console.log(`[TTS] Cache hit for question tag: ${phraseKey}`);
-                introCachedAudio = fs.readFileSync(cachedFile).toString('base64');
-            }
+        // Start the Agent Worker in the background
+        if (activeAgents.has(sessionId)) {
+            const oldAgent = activeAgents.get(sessionId);
+            oldAgent.stop();
         }
+        
+        const agent = new InterviewAgentWorker(sessionId, sessionCache, interviewAgent, io);
+        activeAgents.set(sessionId, agent);
+        
+        // Let agent connect to LiveKit, then manually trigger the first question
+        agent.start().then(() => {
+            const { uniquePart } = parseTTSResponse(resultState.currentQuestion);
+            // We tell the UI the question, and tell the agent to speak it
+            io.to(sessionId).emit('transcript_final', { role: 'ai', text: uniquePart });
+            agent.speak("Hello! Welcome to your AI voice interview. " + uniquePart);
+        }).catch(err => {
+            console.error("[Agent Start Error]", err);
+        });
 
-        // Generate TTS for the unique part of the question (without the tag)
-        if (uniquePart && uniquePart.trim().length > 0) {
-            console.log(`[TTS] Generating speech for question: "${uniquePart}"`);
-            const ttsResult = await textToAudio(uniquePart);
-            questionAudio = ttsResult?.audio ?? ttsResult;
-        }
-
+        // Simplified response, audio is handled via LiveKit now
         res.json({
-            question: uniquePart,
-            audio: questionAudio,
-            feedbackCachedAudio: introCachedAudio, // Frontend plays this first!
             questionNumber: resultState.questionsAsked,
-            difficulty: resultState.difficultyLevel
+            difficulty: resultState.difficultyLevel,
+            agentStarted: true
         });
 
     } catch (error) {
@@ -348,158 +366,7 @@ app.post('/api/interview/start', async (req, res) => {
     }
 });
 
-app.post('/api/interview/answer', async (req, res) => {
-    try {
-        const { sessionId, answer } = req.body;
-        if (!sessionId || !answer) return res.status(400).json({ error: 'Session ID and answer are required' });
-
-        const session = sessionCache[sessionId];
-        if (!session || !session.interviewStateConfig) {
-            return res.status(404).json({ error: 'Interview session not found. Please start the interview first.' });
-        }
-
-        console.log(`Processing interview answer for session: ${sessionId}`);
-        console.log(`🔍 USER SAID: "${answer}"`);
-
-        const inputState = { userAnswer: answer };
-        const resultState = await interviewAgent.invoke(inputState, session.interviewStateConfig);
-
-        let finalReport = null;
-        let responsePayload = {
-            evaluation: resultState.evaluation || {
-                score: 5, accuracy: 5, clarity: 5, depth: 5,
-                feedback: "Thank you for your answer.",
-                nextDifficulty: "same"
-            }
-        };
-
-        console.log(`🔍 EVALUATION FEEDBACK: "${responsePayload.evaluation.feedback}"`);
-
-        if (resultState.finalReport) {
-            // ═══════════════════════════════════════════════════════════════
-            // INTERVIEW IS OVER
-            // ═══════════════════════════════════════════════════════════════
-            finalReport = resultState.finalReport;
-            responsePayload.done = true;
-            responsePayload.finalReport = finalReport;
-
-            const { phraseKeys, uniquePart: lastFbClean } = parseTTSResponse(responsePayload.evaluation.feedback);
-            console.log(`🔍 FINAL FEEDBACK - phraseKeys=${JSON.stringify(phraseKeys)}, uniquePart="${lastFbClean}"`);
-            console.log(`Converting final feedback to audio...`);
-
-            // Build array of cached audio files to play in sequence
-            let cachedAudioSequence = [];
-
-            // Add all cached phrases from feedback (e.g., [thats_okay] [thanks_for_time])
-            if (phraseKeys && phraseKeys.length > 0) {
-                for (const key of phraseKeys) {
-                    const fbFile = checkTTSCache(key);
-                    if (fbFile) {
-                        console.log(`[TTS] Cache hit for final feedback phrase: ${key}`);
-                        cachedAudioSequence.push({
-                            key: key,
-                            audio: fs.readFileSync(fbFile).toString('base64')
-                        });
-                    }
-                }
-            }
-
-            // Generate TTS for unique part if exists
-            let feedbackAudio = null;
-            if (lastFbClean && lastFbClean.trim().length > 0) {
-                const rawAudio = await textToAudio(lastFbClean);
-                feedbackAudio = rawAudio?.audio ?? rawAudio;
-            }
-
-            // Add outro at the end
-            const outroFile = checkTTSCache("interview_outro");
-            if (outroFile) {
-                console.log(`[TTS] Cache hit for outro: interview_outro`);
-                cachedAudioSequence.push({
-                    key: "interview_outro",
-                    audio: fs.readFileSync(outroFile).toString('base64')
-                });
-            }
-
-            // Return sequence: [cached1, cached2, ...] → unique TTS → outro
-            responsePayload.cachedAudioSequence = cachedAudioSequence;
-            responsePayload.feedbackAudio = feedbackAudio;
-        } else {
-            // ═══════════════════════════════════════════════════════════════
-            // INTERVIEW CONTINUES
-            // ═══════════════════════════════════════════════════════════════
-            responsePayload.done = false;
-            responsePayload.nextQuestion = resultState.currentQuestion;
-            responsePayload.questionNumber = resultState.questionsAsked;
-            responsePayload.difficulty = resultState.difficultyLevel;
-
-            console.log(`🔍 NEXT QUESTION: "${resultState.currentQuestion}"`);
-
-            // ── Parse feedback (should have NO tags for normal evaluation) ──
-            const { phraseKey: fbKey, uniquePart: fbUnique } = parseTTSResponse(responsePayload.evaluation.feedback);
-
-            console.log(`🔍 FEEDBACK - phraseKey="${fbKey}", uniquePart="${fbUnique}"`);
-
-            // ── Parse next question (may have [next_question] or [final_question] tag) ──
-            const { phraseKey: qKey, uniquePart: questionSpoken } = parseTTSResponse(resultState.currentQuestion);
-
-            console.log(`🔍 QUESTION - phraseKey="${qKey}", uniquePart="${questionSpoken}"`);
-
-            responsePayload.nextQuestion = questionSpoken;
-
-            // ── Build audio ──
-            let feedbackCachedAudio = null;
-            let questionCachedAudio = null;
-            let combinedTextForTTS = "";
-
-            // FEEDBACK: Check for cached phrase (edge cases only)
-            if (fbKey) {
-                const fbCachedFile = checkTTSCache(fbKey);
-                if (fbCachedFile) {
-                    console.log(`[TTS] Cache hit for feedback: ${fbKey}`);
-                    feedbackCachedAudio = fs.readFileSync(fbCachedFile).toString('base64');
-                }
-            }
-
-            // FEEDBACK: Add unique part to TTS if exists
-            if (fbUnique && fbUnique.trim().length > 0) {
-                combinedTextForTTS += fbUnique + " ";
-            }
-
-            // QUESTION: Check for cached transition phrase
-            if (qKey) {
-                const qCachedFile = checkTTSCache(qKey);
-                if (qCachedFile) {
-                    console.log(`[TTS] Cache hit for question transition: ${qKey}`);
-                    questionCachedAudio = fs.readFileSync(qCachedFile).toString('base64');
-                }
-            }
-
-            // QUESTION: Add unique part to TTS
-            if (questionSpoken && questionSpoken.trim().length > 0) {
-                combinedTextForTTS += questionSpoken;
-            }
-
-            // Generate TTS for combined text
-            let combinedAudio = null;
-            if (combinedTextForTTS.trim().length > 0) {
-                console.log(`[TTS] Generating speech for: "${combinedTextForTTS}"`);
-                const ttsResult = await textToAudio(combinedTextForTTS.trim());
-                combinedAudio = ttsResult?.audio ?? ttsResult;
-            }
-
-            responsePayload.feedbackCachedAudio = feedbackCachedAudio;
-            responsePayload.questionCachedAudio = questionCachedAudio;
-            responsePayload.combinedAudio = combinedAudio;
-        }
-
-        res.json(responsePayload);
-
-    } catch (error) {
-        console.error("Interview answer error:", error);
-        res.status(500).json({ error: error.message || "Failed to process answer" });
-    }
-});
+// No longer needed, agent handles this internally via SessionBridge
 
 // Start the server
 httpServer.listen(PORT, () => {
