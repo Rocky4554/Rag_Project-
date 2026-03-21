@@ -1,4 +1,4 @@
-import { Room, LocalAudioTrack, RemoteAudioTrack, RoomEvent } from "@livekit/rtc-node";
+import { Room, LocalAudioTrack, RemoteAudioTrack, RoomEvent, TrackSource, TrackKind, AudioStream } from "@livekit/rtc-node";
 import { AccessToken } from "livekit-server-sdk";
 import dotenv from "dotenv";
 
@@ -8,7 +8,63 @@ import { generatePCM } from "./tts.js";
 import { SessionBridge } from "./sessionBridge.js";
 import { parseTTSResponse } from "../lib/interviewAgent.js";
 
+// Spoken text for cached TTS phrase keys.
+// The LLM emits tags like [great_answer] which parseTTSResponse strips out.
+// In the LiveKit agent path we can't play MP3 files directly (need PCM),
+// so we map each key to its spoken equivalent and TTS it inline.
+const PHRASE_TEXT = {
+    "lets_move_on":      "Let's move on.",
+    "great_answer":      "Great answer!",
+    "good_effort":       "Good effort.",
+    "take_your_time":    "Take your time.",
+    "no_worries":        "No worries.",
+    "interesting":       "Interesting.",
+    "next_question":     "Next question.",
+    "final_question":    "This is the final question.",
+    "thats_okay":        "That's okay.",
+    "thanks_for_time":   "Thanks for your time.",
+    "interview_intro":   "Welcome to your interview.",
+    "interview_outro":   "That concludes our interview.",
+    "interview_stopped": "The interview has been stopped.",
+    "out_of_context":    "Let's stay on topic.",
+};
+
 dotenv.config();
+
+/**
+ * Wraps raw 16-bit PCM in a minimal WAV header so the browser can play it
+ * via a simple <audio> element. Returns a base64-encoded WAV string.
+ */
+function pcmToWavBase64(pcmInt16, sampleRate = 16000, channels = 1) {
+    const bytesPerSample = 2;
+    const dataSize = pcmInt16.length * bytesPerSample;
+    const buffer = Buffer.alloc(44 + dataSize);
+
+    // RIFF header
+    buffer.write("RIFF", 0);
+    buffer.writeUInt32LE(36 + dataSize, 4);
+    buffer.write("WAVE", 8);
+
+    // fmt chunk
+    buffer.write("fmt ", 12);
+    buffer.writeUInt32LE(16, 16);               // chunk size
+    buffer.writeUInt16LE(1, 20);                // PCM format
+    buffer.writeUInt16LE(channels, 22);
+    buffer.writeUInt32LE(sampleRate, 24);
+    buffer.writeUInt32LE(sampleRate * channels * bytesPerSample, 28); // byte rate
+    buffer.writeUInt16LE(channels * bytesPerSample, 32);              // block align
+    buffer.writeUInt16LE(16, 34);               // bits per sample
+
+    // data chunk
+    buffer.write("data", 36);
+    buffer.writeUInt32LE(dataSize, 40);
+
+    // Copy PCM samples
+    const pcmBuf = Buffer.from(pcmInt16.buffer, pcmInt16.byteOffset, dataSize);
+    pcmBuf.copy(buffer, 44);
+
+    return buffer.toString("base64");
+}
 
 export class InterviewAgentWorker {
     /**
@@ -49,7 +105,7 @@ export class InterviewAgentWorker {
         const track = LocalAudioTrack.createAudioTrack("ai-interviewer-audio", this.audioPublisher.source);
         await this.room.localParticipant.publishTrack(track, {
             name: "ai-interviewer-audio",
-            source: 1 // TrackSource.SOURCE_MICROPHONE
+            source: TrackSource.SOURCE_MICROPHONE // properly imported enum
         });
         console.log(`[AgentWorker] Published AI audio track`);
 
@@ -72,7 +128,8 @@ export class InterviewAgentWorker {
 
     setupRoomEvents() {
         this.room.on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
-            if (track.kind === "audio" && track instanceof RemoteAudioTrack) {
+            console.log(`[AgentWorker] TrackSubscribed: kind=${track.kind}, from=${participant.identity}`);
+            if (track.kind === TrackKind.KIND_AUDIO) {
                 console.log(`[AgentWorker] Subscribed to audio from: ${participant.identity}`);
                 this.listenToUserAudio(track);
             }
@@ -98,19 +155,25 @@ export class InterviewAgentWorker {
     }
 
     listenToUserAudio(track) {
-        // Create an audio stream listener from the candidate's remote track
-        // The track must be attached to an AudioStream
-        // Note: in @livekit/rtc-node, we use track.receiver or a stream
-        // According to current rtc-node docs:
-        track.on("audioData", (audioData) => {
-            // Only send audio to STT if we are not actively processing a turn
-            if (!this.processingTurn && !this.audioPublisher.isSpeaking) {
-                // audioData is { data: Int16Array, sampleRate: number, numChannels: number }
-                if (audioData.data) {
-                    this.stt.pushAudio(audioData.data);
+        // Use AudioStream to receive PCM frames from the remote track.
+        // AudioStream is an async iterable that yields AudioFrame objects.
+        const audioStream = new AudioStream(track);
+
+        (async () => {
+            try {
+                for await (const frame of audioStream) {
+                    // Only forward audio to STT when the agent is idle
+                    if (!this.processingTurn && !this.audioPublisher.isSpeaking) {
+                        if (frame.data) {
+                            this.stt.pushAudio(frame.data);
+                        }
+                    }
                 }
+                console.log("[AgentWorker] User audio stream ended.");
+            } catch (err) {
+                console.error("[AgentWorker] User audio stream error:", err.message);
             }
-        });
+        })();
     }
 
     async handleUserTurn(transcript) {
@@ -140,11 +203,10 @@ export class InterviewAgentWorker {
                 if (this.io) {
                     this.io.to(this.sessionId).emit('interview_done', { report: result.finalReport });
                 }
-                
-                // Play outro (you could optionally TTS a custom goodbye here)
+
                 const pcm = await generatePCM("Thank you for your time. The interview is now complete. You can review your report on the screen.");
-                if (pcm) await this.audioPublisher.pushPCM(pcm);
-                
+                if (pcm) await this._playAudio(pcm);
+
                 setTimeout(() => this.stop(), 2000);
             } else {
                 // Next question
@@ -153,16 +215,19 @@ export class InterviewAgentWorker {
                     this.io.to(this.sessionId).emit('ai_state', { state: 'speaking', text: 'AI Speaking...' });
                 }
 
-                // Strip TTS tags before speaking
-                const { uniquePart: cleanFeedback } = parseTTSResponse(result.evaluation.feedback || "");
-                const { uniquePart: cleanQuestion } = parseTTSResponse(result.nextQuestion || "");
-                
-                const spokenText = `${cleanFeedback} ${cleanQuestion}`.trim();
-                
+                // Parse TTS tags and build full spoken text (phrase text + unique part)
+                const parsedFeedback = parseTTSResponse(result.evaluation.feedback || "");
+                const parsedQuestion = parseTTSResponse(result.nextQuestion || "");
+
+                const feedbackPhrases = (parsedFeedback.phraseKeys || []).map(k => PHRASE_TEXT[k] || "").join(" ");
+                const questionPhrases = (parsedQuestion.phraseKeys || []).map(k => PHRASE_TEXT[k] || "").join(" ");
+
+                const spokenText = `${feedbackPhrases} ${parsedFeedback.uniquePart} ${questionPhrases} ${parsedQuestion.uniquePart}`.replace(/\s+/g, " ").trim();
+
                 if (spokenText) {
                     const pcmData = await generatePCM(spokenText, "16000");
                     if (pcmData) {
-                        await this.audioPublisher.pushPCM(pcmData);
+                        await this._playAudio(pcmData);
                     }
                 }
 
@@ -181,15 +246,35 @@ export class InterviewAgentWorker {
     /**
      * Can be called manually to make the agent speak (e.g. for the very first question)
      */
+    /**
+     * Sends PCM audio via both LiveKit (WebRTC) and Socket.io (WAV fallback).
+     * The client plays whichever path is available.
+     */
+    async _playAudio(pcm) {
+        if (!pcm) return;
+        // LiveKit WebRTC — primary audio path
+        await this.audioPublisher.pushPCM(pcm);
+    }
+
     async speak(text) {
         if (!text) return;
         this.processingTurn = true;
         try {
-            const { uniquePart } = parseTTSResponse(text);
-            if (uniquePart) {
-                const pcm = await generatePCM(uniquePart, "16000");
-                if (pcm) await this.audioPublisher.pushPCM(pcm);
+            const parsed = parseTTSResponse(text);
+            const phrases = (parsed.phraseKeys || []).map(k => PHRASE_TEXT[k] || "").join(" ");
+            const fullText = `${phrases} ${parsed.uniquePart}`.replace(/\s+/g, " ").trim();
+
+            if (fullText) {
+                console.log(`[AgentWorker] Speaking: "${fullText.substring(0, 80)}..."`);
+                const pcm = await generatePCM(fullText, "16000");
+                if (pcm) {
+                    await this._playAudio(pcm);
+                } else {
+                    console.error(`[AgentWorker] TTS returned null — Polly may have failed. Check AWS credentials/region.`);
+                }
             }
+        } catch (err) {
+            console.error(`[AgentWorker] speak() error:`, err);
         } finally {
             this.processingTurn = false;
         }

@@ -9,17 +9,26 @@ export class DeepgramSTT extends EventEmitter {
         super();
         this.socket = null;
         this.isReady = false;
-        
+        this._stopped = false;
+        this._keepaliveTimer = null;
+
         // Settings from .env
         this.model = process.env.DEEPGRAM_STT_MODEL || "nova-3";
         this.language = process.env.DEEPGRAM_STT_LANGUAGE || "en";
         this.smartFormat = (process.env.DEEPGRAM_STT_SMART_FORMAT || "true") === "true";
         this.endpointing = parseInt(process.env.DEEPGRAM_STT_ENDPOINTING_MS || "500", 10);
-        
+
         this.currentTranscript = "";
     }
 
     start() {
+        this._stopped = false;
+        this._connect();
+    }
+
+    _connect() {
+        if (this._stopped) return;
+
         const apiKey = process.env.DEEPGRAM_API_KEY;
         if (!apiKey) throw new Error("DEEPGRAM_API_KEY is missing");
 
@@ -35,9 +44,9 @@ export class DeepgramSTT extends EventEmitter {
         });
 
         const url = `wss://api.deepgram.com/v1/listen?${params.toString()}`;
-        
-        console.log(`[STT] Connecting to Deepgram: ${url}`);
-        
+
+        console.log(`[STT] Connecting to Deepgram...`);
+
         this.socket = new WebSocket(url, {
             headers: {
                 Authorization: `Token ${apiKey}`
@@ -47,6 +56,7 @@ export class DeepgramSTT extends EventEmitter {
         this.socket.on("open", () => {
             console.log("[STT] Deepgram WebSocket opened.");
             this.isReady = true;
+            this._startKeepalive();
         });
 
         this.socket.on("message", (data) => {
@@ -55,7 +65,7 @@ export class DeepgramSTT extends EventEmitter {
                 if (msg.type === "Results" && msg.channel && msg.channel.alternatives[0]) {
                     const alt = msg.channel.alternatives[0];
                     const text = alt.transcript;
-                    
+
                     if (text) {
                         if (msg.is_final) {
                             this.currentTranscript += text + " ";
@@ -79,6 +89,13 @@ export class DeepgramSTT extends EventEmitter {
         this.socket.on("close", () => {
             console.log("[STT] Deepgram WebSocket closed.");
             this.isReady = false;
+            this._stopKeepalive();
+
+            // Auto-reconnect unless explicitly stopped
+            if (!this._stopped) {
+                console.log("[STT] Reconnecting in 1s...");
+                setTimeout(() => this._connect(), 1000);
+            }
         });
 
         this.socket.on("error", (err) => {
@@ -88,18 +105,45 @@ export class DeepgramSTT extends EventEmitter {
     }
 
     /**
+     * Send a keepalive message every 8s to prevent Deepgram from closing
+     * the WebSocket during AI speaking pauses (its idle timeout is ~10-12s).
+     */
+    _startKeepalive() {
+        this._stopKeepalive();
+        this._keepaliveTimer = setInterval(() => {
+            if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+                this.socket.send(JSON.stringify({ type: "KeepAlive" }));
+            }
+        }, 8000);
+    }
+
+    _stopKeepalive() {
+        if (this._keepaliveTimer) {
+            clearInterval(this._keepaliveTimer);
+            this._keepaliveTimer = null;
+        }
+    }
+
+    /**
      * Pushes raw audio frames (Int16Array) from LiveKit directly into Deepgram
      */
     pushAudio(int16Array) {
         if (this.isReady && this.socket && this.socket.readyState === WebSocket.OPEN) {
-            this.socket.send(int16Array.buffer);
+            // Use byteOffset/byteLength to send only the viewed slice,
+            // not the entire underlying ArrayBuffer (which may be larger).
+            const buf = Buffer.from(
+                int16Array.buffer,
+                int16Array.byteOffset,
+                int16Array.byteLength
+            );
+            this.socket.send(buf);
         }
     }
 
     stop() {
+        this._stopped = true;
+        this._stopKeepalive();
         if (this.socket) {
-            // Deepgram close sequence requires a specific message or just closing the socket
-            // We'll just close it.
             this.socket.close();
             this.socket = null;
         }

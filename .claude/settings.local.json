@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(timeout 10 node -e \"const m = await import\\(''@livekit/rtc-node''\\); const src = new m.AudioSource\\(16000, 1\\); const proto = Object.getPrototypeOf\\(src\\); console.log\\(Object.getOwnPropertyNames\\(proto\\)\\); console.log\\(proto.captureFrame.toString\\(\\).substring\\(0, 400\\)\\); process.exit\\(0\\);\")",
+      "Bash(powershell -Command \"Get-ItemProperty 'HKLM:\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Uninstall\\\\*','HKLM:\\\\Software\\\\WOW6432Node\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Uninstall\\\\*','HKCU:\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Uninstall\\\\*' 2>$null | Where-Object { $_.DisplayName -like '*amp*' } | Select-Object DisplayName,InstallDate,UninstallString | Format-List\")",
+      "Bash(powershell -Command \"Get-ItemProperty 'HKLM:\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Uninstall\\\\*','HKLM:\\\\Software\\\\WOW6432Node\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Uninstall\\\\*','HKCU:\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Uninstall\\\\*' -ErrorAction SilentlyContinue | Where-Object { \\\\$_.DisplayName -like '*amp*' } | Select-Object DisplayName,InstallDate,UninstallString | Format-List\")",
+      "Bash(powershell -Command \"Get-ItemProperty 'HKLM:\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Uninstall\\\\*','HKLM:\\\\Software\\\\WOW6432Node\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Uninstall\\\\*','HKCU:\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Uninstall\\\\*' -ErrorAction SilentlyContinue | Where-Object { \\\\$_.DisplayName -like '*time*champ*' -or \\\\$_.DisplayName -like '*timechamp*' } | Select-Object DisplayName,InstallDate,InstallLocation,UninstallString | Format-List\")"
+    ]
+  }
+}

@@ -46,6 +46,9 @@ console.log(`   QDRANT_URL        : ${process.env.QDRANT_URL ? '✅ Loaded' : '�
 console.log(`   QDRANT_API_KEY    : ${process.env.QDRANT_API_KEY ? '✅ Loaded' : '❌ Missing'}`);
 console.log(`========================================\n`);
 
+// Map to hold pending "wait for client ready" resolvers, keyed by sessionId
+const clientReadyResolvers = new Map();
+
 // ── Socket.io: register socket per session for AI streaming ──────
 io.on('connection', (socket) => {
     console.log(`[Socket.io] Client connected: ${socket.id}`);
@@ -56,6 +59,17 @@ io.on('connection', (socket) => {
             socket.data.sessionId = sessionId;
             registerSocket(sessionId, socket);
             console.log(`[Socket.io] Socket ${socket.id} registered for session: ${sessionId}`);
+        }
+    });
+
+    // Browser emits this once it has subscribed to the AI audio track
+    // and its WebRTC connection is ready to receive audio frames
+    socket.on('client_audio_ready', (sessionId) => {
+        console.log(`[Socket.io] 🔊 client_audio_ready for session: ${sessionId}`);
+        const resolve = clientReadyResolvers.get(sessionId);
+        if (resolve) {
+            clientReadyResolvers.delete(sessionId);
+            resolve();
         }
     });
 
@@ -343,12 +357,30 @@ app.post('/api/interview/start', async (req, res) => {
         const agent = new InterviewAgentWorker(sessionId, sessionCache, interviewAgent, io);
         activeAgents.set(sessionId, agent);
         
-        // Let agent connect to LiveKit, then manually trigger the first question
-        agent.start().then(() => {
+        // Let agent connect to LiveKit, then wait for the browser to signal it is
+        // subscribed and its WebRTC ICE pathway is fully open before speaking.
+        // This replaces the blind setTimeout and prevents audio frames being dropped.
+        agent.start().then(async () => {
             const { uniquePart } = parseTTSResponse(resultState.currentQuestion);
-            // We tell the UI the question, and tell the agent to speak it
+            // Tell the UI the question text immediately
             io.to(sessionId).emit('transcript_final', { role: 'ai', text: uniquePart });
-            agent.speak("Hello! Welcome to your AI voice interview. " + uniquePart);
+
+            // Wait for client_audio_ready signal (or fall back after 10s)
+            console.log(`[Agent] Waiting for client audio ready signal for: ${sessionId}`);
+            await new Promise((resolve) => {
+                clientReadyResolvers.set(sessionId, resolve);
+                // 10-second safety fallback in case the signal is never received
+                setTimeout(() => {
+                    if (clientReadyResolvers.has(sessionId)) {
+                        console.warn(`[Agent] client_audio_ready timeout — speaking anyway for: ${sessionId}`);
+                        clientReadyResolvers.delete(sessionId);
+                        resolve();
+                    }
+                }, 10000);
+            });
+
+            console.log(`[Agent] Client ready — speaking first question for: ${sessionId}`);
+            await agent.speak("Hello! Welcome to your AI voice interview. " + uniquePart);
         }).catch(err => {
             console.error("[Agent Start Error]", err);
         });

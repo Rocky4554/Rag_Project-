@@ -522,7 +522,7 @@
     </div>
 
     <script src="/socket.io/socket.io.js"></script>
-    <script src="https://unpkg.com/livekit-client@2/dist/livekit-client.umd.min.js"></script>
+    <script src="/livekit-client.umd.min.js"></script>
     <script>
         // State
         let sessionId = null;
@@ -898,9 +898,11 @@
 
         // ── LiveKit: connect to a room for WebRTC audio ──
         async function connectLiveKit(sid) {
+            const statusEl = document.getElementById('interview-status');
             try {
                 if (typeof LivekitClient === 'undefined') {
                     console.warn('[LiveKit] SDK not loaded, skipping room connection.');
+                    if (statusEl) statusEl.textContent = '⚠️ LiveKit SDK not loaded';
                     return;
                 }
 
@@ -910,7 +912,11 @@
                     livekitRoom = null;
                 }
 
+                // Clean up any old audio elements we created
+                document.querySelectorAll('.lk-audio-track').forEach(el => el.remove());
+
                 // Get token from our server
+                if (statusEl) statusEl.textContent = '🔗 Connecting to voice room...';
                 const res = await fetch('/api/livekit/token', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -919,56 +925,151 @@
                 const { token, url, error } = await res.json();
                 if (!res.ok) throw new Error(error || 'Token request failed');
 
-                // Create and connect the room
+                // Create room — autoSubscribe defaults to true
                 livekitRoom = new LivekitClient.Room({
-                    audioCaptureDefaults: {
-                        echoCancellation: true,
-                        noiseSuppression: true,
-                        autoGainControl: true,
-                    },
-                    adaptiveStream: true,
-                    dynacast: true,
+                    adaptiveStream: false,
+                    dynacast: false,
                 });
 
-                // Create one persistent audio sink to avoid autoplay/race issues.
-                if (!livekitAudioEl) {
-                    livekitAudioEl = document.createElement('audio');
-                    livekitAudioEl.autoplay = true;
-                    livekitAudioEl.playsInline = true;
-                    livekitAudioEl.style.display = 'none';
-                    document.body.appendChild(livekitAudioEl);
-                }
-
-                // When a remote audio track is published (AI voice via LiveKit)
+                // ── Track subscription handler ──────────────────────────────
                 livekitRoom.on(LivekitClient.RoomEvent.TrackSubscribed, (track, pub, participant) => {
+                    console.log(`[LiveKit] 🎵 TrackSubscribed: kind=${track.kind}, from=${participant.identity}`);
+                    if (statusEl) statusEl.textContent = `🔊 Ready! Waiting for AI to speak...`;
+
                     if (track.kind === LivekitClient.Track.Kind.Audio) {
-                        console.log('[LiveKit] Received audio track from:', participant.identity);
-                        track.attach(livekitAudioEl);
-                        const playPromise = livekitAudioEl.play();
-                        if (playPromise && typeof playPromise.catch === 'function') {
-                            playPromise.catch((err) => {
-                                console.warn('[LiveKit] Audio autoplay blocked:', err?.message || err);
+                        // Create audio element, attach track's MediaStream, then force play()
+                        const audioEl = document.createElement('audio');
+                        audioEl.className = 'lk-audio-track';
+                        audioEl.autoplay = true;
+                        audioEl.style.display = 'none';
+                        document.body.appendChild(audioEl);
+                        track.attach(audioEl);   // sets audioEl.srcObject = MediaStream
+
+                        // Give ICE/DTLS ~1s to fully finalize before telling server to speak
+                        setTimeout(() => {
+                            audioEl.play().then(() => {
+                                console.log('[LiveKit] ✅ Audio playing — signalling server to speak');
+                                // Tell server the browser is ready to receive audio
+                                if (window._ivSocket && sessionId) {
+                                    window._ivSocket.emit('client_audio_ready', sessionId);
+                                }
+                                if (statusEl) statusEl.textContent = '';
+                            }).catch(err => {
+                                console.warn('[LiveKit] ⚠️ play() blocked:', err.message);
+                                if (statusEl) {
+                                    statusEl.innerHTML = '🔇 <strong>Click here to unmute audio</strong>';
+                                    statusEl.style.cursor = 'pointer';
+                                    statusEl.onclick = () => {
+                                        audioEl.play().catch(() => {});
+                                        livekitRoom.startAudio();
+                                        if (window._ivSocket && sessionId) {
+                                            window._ivSocket.emit('client_audio_ready', sessionId);
+                                        }
+                                        statusEl.textContent = '';
+                                        statusEl.style.cursor = '';
+                                        statusEl.onclick = null;
+                                    };
+                                }
                             });
-                        }
+                        }, 1000);
+                        console.log('[LiveKit] ✅ Audio element attached and appended to DOM');
                     }
+                });
+
+                livekitRoom.on(LivekitClient.RoomEvent.TrackUnsubscribed, (track, pub, participant) => {
+                    console.log(`[LiveKit] Track unsubscribed from: ${participant.identity}`);
+                    track.detach();  // removes all attached elements
+                });
+
+                livekitRoom.on(LivekitClient.RoomEvent.ParticipantConnected, (participant) => {
+                    console.log(`[LiveKit] Participant joined: ${participant.identity}`);
+                });
+
+                livekitRoom.on(LivekitClient.RoomEvent.Reconnecting, () => {
+                    console.warn('[LiveKit] ⚠️ Reconnecting...');
+                    if (statusEl) statusEl.textContent = '⚠️ Reconnecting...';
+                });
+
+                livekitRoom.on(LivekitClient.RoomEvent.Reconnected, () => {
+                    console.log('[LiveKit] ✅ Reconnected — re-attaching audio tracks');
+                    if (statusEl) statusEl.textContent = '✅ Reconnected';
+                    // Re-attach any existing remote audio tracks after reconnection
+                    livekitRoom.remoteParticipants.forEach((participant) => {
+                        participant.trackPublications.forEach((pub) => {
+                            if (pub.track && pub.track.kind === LivekitClient.Track.Kind.Audio) {
+                                // Remove old audio elements
+                                document.querySelectorAll('.lk-audio-track').forEach(el => el.remove());
+                                const audioEl = pub.track.attach();
+                                audioEl.className = 'lk-audio-track';
+                                audioEl.autoplay = true;
+                                audioEl.style.display = 'none';
+                                document.body.appendChild(audioEl);
+                                audioEl.play().catch(() => {});
+                            }
+                        });
+                    });
                 });
 
                 livekitRoom.on(LivekitClient.RoomEvent.Disconnected, (reason) => {
                     console.log('[LiveKit] Disconnected:', reason);
+                    if (statusEl) statusEl.textContent = '';
                 });
 
+                livekitRoom.on(LivekitClient.RoomEvent.AudioPlaybackStatusChanged, () => {
+                    if (!livekitRoom.canPlaybackAudio) {
+                        console.warn('[LiveKit] Audio playback blocked — calling startAudio()');
+                        livekitRoom.startAudio();
+                    }
+                });
+
+                // Connect
                 await livekitRoom.connect(url, token);
                 console.log('[LiveKit] ✅ Connected to room:', livekitRoom.name);
+                if (statusEl) statusEl.textContent = '✅ Connected to voice room. Starting interview...';
 
-                // Publish mic audio into the LiveKit room
+                // Unlock audio — MUST happen from a user-gesture call stack (button click → startInterview → here)
+                await livekitRoom.startAudio();
+                console.log('[LiveKit] 🔊 Audio context unlocked');
+
+                // Attach tracks from participants already in the room (race-condition guard)
+                livekitRoom.remoteParticipants.forEach((participant) => {
+                    participant.trackPublications.forEach((pub) => {
+                        if (pub.track && pub.track.kind === LivekitClient.Track.Kind.Audio) {
+                            console.log('[LiveKit] ⚡ Attaching pre-existing audio track from:', participant.identity);
+                            const audioEl = pub.track.attach();
+                            audioEl.className = 'lk-audio-track';
+                            audioEl.autoplay = true;
+                            audioEl.style.display = 'none';
+                            document.body.appendChild(audioEl);
+
+                            // Signal server that we're ready (same as TrackSubscribed path)
+                            audioEl.play().then(() => {
+                                console.log('[LiveKit] ✅ Pre-existing track playing — signalling server');
+                                if (window._ivSocket && sessionId) {
+                                    window._ivSocket.emit('client_audio_ready', sessionId);
+                                }
+                            }).catch(() => {
+                                // Autoplay blocked — signal anyway, server timeout would catch this
+                                if (window._ivSocket && sessionId) {
+                                    window._ivSocket.emit('client_audio_ready', sessionId);
+                                }
+                            });
+                        }
+                    });
+                });
+
+                // Enable microphone so agent can hear the candidate
                 await livekitRoom.localParticipant.setMicrophoneEnabled(true);
                 console.log('[LiveKit] 🎤 Microphone published to room');
 
             } catch (err) {
-                // Non-fatal: interview still works via Web Speech API + Socket.io
-                console.warn('[LiveKit] Connection failed (non-fatal):', err.message);
+                console.error('[LiveKit] Connection failed:', err.message);
+                if (statusEl) statusEl.textContent = `❌ LiveKit error: ${err.message}`;
             }
         }
+
+
+
 
         async function startInterview() {
             ivLength = parseInt(document.getElementById('interview-length').value) || 5;
@@ -1029,6 +1130,22 @@
             // ── play_tts: disabled, agent plays audio natively ──
             socket.on('play_tts', ({ key, audio }) => {
                 console.log('[Socket] play_tts event received but agent handles audio now');
+            });
+
+            // ── play_audio: Socket.io WAV fallback when LiveKit WebRTC is unreliable ──
+            socket.on('play_audio', ({ audio }) => {
+                console.log('[Socket] play_audio: received WAV fallback');
+                try {
+                    const audioEl = document.createElement('audio');
+                    audioEl.src = 'data:audio/wav;base64,' + audio;
+                    audioEl.autoplay = true;
+                    audioEl.style.display = 'none';
+                    document.body.appendChild(audioEl);
+                    audioEl.play().catch(err => console.warn('[Socket] play_audio blocked:', err.message));
+                    audioEl.onended = () => audioEl.remove();
+                } catch (err) {
+                    console.error('[Socket] play_audio error:', err);
+                }
             });
 
             // ── real-time states from agent ──

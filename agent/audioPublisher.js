@@ -21,30 +21,46 @@ export class AudioPublisher {
         this.stopFlag = false;
         console.log(`[AudioPublisher] Starting playback of ${pcmData.length} samples at ${this.sampleRate}Hz`);
 
+        const startTime = performance.now();
+        let chunksSent = 0;
+
         for (let offset = 0; offset < pcmData.length; offset += this.samplesPerChunk) {
             if (this.stopFlag) {
                 console.log("[AudioPublisher] Playback interrupted.");
                 break;
             }
 
-            // Slice exactly samplesPerChunk samples (pad last chunk if needed)
             let chunkData;
             if (offset + this.samplesPerChunk <= pcmData.length) {
-                chunkData = pcmData.subarray(offset, offset + this.samplesPerChunk);
+                // MUST use .slice() not .subarray() — subarray shares the parent
+                // ArrayBuffer, and livekit-rtc-node's AudioFrame.protoInfo() reads
+                // from this.data.buffer (byte 0 of the underlying buffer).  With
+                // subarray every frame would contain the same first 160 samples.
+                chunkData = pcmData.slice(offset, offset + this.samplesPerChunk);
             } else {
                 chunkData = new Int16Array(this.samplesPerChunk);
                 chunkData.set(pcmData.subarray(offset));
             }
 
-            // Wrap in LiveKit AudioFrame — captureFrame requires this, not raw Int16Array
             const frame = new AudioFrame(
                 chunkData,
                 this.sampleRate,
                 this.channels,
-                this.samplesPerChunk  // samplesPerChannel
+                this.samplesPerChunk
             );
 
             await this.source.captureFrame(frame);
+            chunksSent++;
+
+            // Precise pacing: calculate when the next chunk SHOULD be sent
+            // and wait exactly that long, avoiding event loop drift
+            const nextChunkTime = startTime + (chunksSent * 10);
+            const now = performance.now();
+            const delay = nextChunkTime - now;
+
+            if (delay > 0) {
+                await new Promise(resolve => setTimeout(resolve, delay));
+            }
         }
 
         console.log("[AudioPublisher] Playback complete.");

@@ -53,7 +53,10 @@ export async function generatePCM(text, sampleRate = "16000") {
         return int16Array;
 
     } catch (err) {
-        console.error("[Agent TTS] Failed to generate PCM audio:", err);
+        console.error("[Agent TTS] Failed to generate PCM audio:", err.message);
+        console.error("[Agent TTS] Check: AWS_REGION=%s, POLLY_VOICE_ID=%s, POLLY_ENGINE=%s",
+            process.env.AWS_REGION, process.env.POLLY_VOICE_ID, process.env.POLLY_ENGINE);
+        console.error("[Agent TTS] Note: Neural voices may not be available in all AWS regions. Try AWS_REGION=us-east-1 or POLLY_ENGINE=standard");
         return null;
     }
 }
