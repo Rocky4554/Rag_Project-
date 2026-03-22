@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
+import cookieParser from 'cookie-parser';
 import rateLimit from 'express-rate-limit';
 import multer from 'multer';
 import path from 'path';
@@ -107,6 +108,7 @@ app.use(helmet({
     crossOriginEmbedderPolicy: false
 }));
 app.use(cors({ origin: allowedOrigins, methods: ['GET', 'POST'], credentials: true }));
+app.use(cookieParser());
 app.use(express.json({ limit: '5mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 

@@ -1,46 +1,37 @@
-import { supabaseAdmin } from '../lib/supabase.js';
+import { verifyToken } from '../lib/jwt.js';
 
 /**
- * Auth middleware — extracts user from Supabase JWT.
- * Attaches req.user = { id, email, ... } on success.
- * Returns 401 if no valid token.
+ * Auth middleware — extracts user from JWT cookie.
+ * Attaches req.user = { id, email, name } on success.
  */
 export async function requireAuth(req, res, next) {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({ error: 'Missing or invalid authorization header' });
+    const token = req.cookies?.access_token;
+    if (!token) {
+        return res.status(401).json({ error: 'Not authenticated' });
     }
 
-    const token = authHeader.split(' ')[1];
-
     try {
-        const { data: { user }, error } = await supabaseAdmin.auth.getUser(token);
-        if (error || !user) {
-            return res.status(401).json({ error: 'Invalid or expired token' });
-        }
-        req.user = user;
+        const decoded = verifyToken(token);
+        req.user = { id: decoded.id, email: decoded.email, name: decoded.name };
         next();
     } catch (err) {
-        console.error('[Auth Middleware]', err.message);
-        return res.status(401).json({ error: 'Authentication failed' });
+        return res.status(401).json({ error: 'Invalid or expired token' });
     }
 }
 
 /**
- * Optional auth — attaches req.user if token present, but doesn't block.
- * Useful for endpoints that work with or without auth.
+ * Optional auth — attaches req.user if cookie present, but doesn't block.
  */
 export async function optionalAuth(req, res, next) {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    const token = req.cookies?.access_token;
+    if (!token) {
         req.user = null;
         return next();
     }
 
-    const token = authHeader.split(' ')[1];
     try {
-        const { data: { user }, error } = await supabaseAdmin.auth.getUser(token);
-        req.user = error ? null : user;
+        const decoded = verifyToken(token);
+        req.user = { id: decoded.id, email: decoded.email, name: decoded.name };
     } catch {
         req.user = null;
     }
