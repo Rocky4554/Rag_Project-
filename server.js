@@ -1,71 +1,89 @@
 import express from 'express';
 import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import { createRequire } from 'module';
 import { createServer } from 'http';
 import { Server as SocketIOServer } from 'socket.io';
-import { AccessToken } from 'livekit-server-sdk';
 
-import { extractTextFromPDF } from "./lib/pdfLoader.js";
-import { splitText } from "./lib/textSplitter.js";
-import { storeDocuments } from "./lib/vectorStore.js";
-import { generateQuiz } from "./lib/quizGenerator.js";
-import { summarizeDocs } from "./lib/summarizer.js";
-import { textToAudio } from "./lib/speechToAudio.js";
-import { queryRAG } from "./lib/rag.js";
-import { createInterviewAgent, registerVectorStore, registerSocket, unregisterSocket, parseTTSResponse, checkTTSCache } from "./lib/interviewAgent.js";
-import { HumanMessage, AIMessage } from "@langchain/core/messages";
-import { InterviewAgentWorker } from "./agent/agent.js";
-
-// Global map to hold active agents
-const activeAgents = new Map();
-const require = createRequire(import.meta.url);
-const { DeepgramClient } = require('@deepgram/sdk');
+import { validateEnv, printEnvStatus } from './lib/env.js';
+import { serverLog } from './lib/logger.js';
+import { registerSocket, unregisterSocket, createInterviewAgent } from "./lib/interview/interviewAgent.js";
+import { createUploadRoutes } from './routes/upload.js';
+import { createChatRoutes } from './routes/chat.js';
+import { createQuizRoutes } from './routes/quiz.js';
+import { createSummaryRoutes } from './routes/summary.js';
+import { createTokenRoutes } from './routes/tokens.js';
+import { createInterviewRoutes } from './routes/interview.js';
+import { createAuthRoutes } from './routes/auth.js';
+import { createHistoryRoutes } from './routes/history.js';
+import { createSessionRoutes } from './routes/session.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// ── Validate environment before anything else ────────────────────
+validateEnv();
+printEnvStatus();
+
+// ── App setup ─────────────────────────────────────────────────────
 const app = express();
 const httpServer = createServer(app);
-const io = new SocketIOServer(httpServer, {
-    cors: { origin: "*", methods: ["GET", "POST"] }
-});
 const PORT = process.env.PORT || 3000;
 
-console.log(`\n========================================`);
-console.log(`🔑 API Key Verification:`);
-console.log(`   GROQ_API_KEY      : ${process.env.GROQ_API_KEY ? '✅ Loaded' : '❌ Missing'}`);
-console.log(`   GEMINI_API_KEY    : ${process.env.GEMINI_API_KEY ? '✅ Loaded' : '❌ Missing/Not Used'}`);
-console.log(`   AWS_ACCESS_KEY_ID : ${process.env.AWS_ACCESS_KEY_ID ? '✅ Loaded' : '❌ Missing'}`);
-console.log(`   KOKORO_API_URL    : ${process.env.KOKORO_API_URL ? '✅ Loaded' : '⚠️ Defaulting'}`);
-console.log(`   LIVEKIT_API_KEY   : ${process.env.LIVEKIT_API_KEY ? '✅ Loaded' : '❌ Missing'}`);
-console.log(`   QDRANT_URL        : ${process.env.QDRANT_URL ? '✅ Loaded' : '❌ Missing'}`);
-console.log(`   QDRANT_API_KEY    : ${process.env.QDRANT_API_KEY ? '✅ Loaded' : '❌ Missing'}`);
-console.log(`========================================\n`);
+const allowedOrigins = process.env.CORS_ORIGINS
+    ? process.env.CORS_ORIGINS.split(',').map(s => s.trim())
+    : [`http://localhost:${PORT}`];
 
-// Map to hold pending "wait for client ready" resolvers, keyed by sessionId
+const io = new SocketIOServer(httpServer, {
+    cors: { origin: allowedOrigins, methods: ["GET", "POST"] }
+});
+
+// ── Shared state ─────────────────────────────────────────────────
+const sessionCache = {};
+const activeAgents = new Map();
 const clientReadyResolvers = new Map();
 
-// ── Socket.io: register socket per session for AI streaming ──────
+// ── Session TTL cleanup (prevents memory leak) ──────────────────
+const SESSION_TTL = parseInt(process.env.SESSION_TTL_MS) || 2 * 60 * 60 * 1000; // 2 hours default
+
+setInterval(() => {
+    const now = Date.now();
+    let cleaned = 0;
+    for (const [id, session] of Object.entries(sessionCache)) {
+        if (now - (session.createdAt || 0) > SESSION_TTL) {
+            // Stop active agent if running
+            if (activeAgents.has(id)) {
+                activeAgents.get(id).stop();
+                activeAgents.delete(id);
+            }
+            delete sessionCache[id];
+            cleaned++;
+        }
+    }
+    if (cleaned > 0) {
+        serverLog.info({ cleaned, remaining: Object.keys(sessionCache).length }, 'Session cleanup');
+    }
+}, 10 * 60 * 1000); // check every 10 minutes
+
+// ── Socket.io ────────────────────────────────────────────────────
 io.on('connection', (socket) => {
-    console.log(`[Socket.io] Client connected: ${socket.id}`);
+    serverLog.debug({ socketId: socket.id }, 'Client connected');
 
     socket.on('register_session', (sessionId) => {
-        if (sessionId) {
+        if (sessionId && typeof sessionId === 'string') {
             socket.join(sessionId);
             socket.data.sessionId = sessionId;
             registerSocket(sessionId, socket);
-            console.log(`[Socket.io] Socket ${socket.id} registered for session: ${sessionId}`);
+            serverLog.debug({ socketId: socket.id, sessionId }, 'Session registered');
         }
     });
 
-    // Browser emits this once it has subscribed to the AI audio track
-    // and its WebRTC connection is ready to receive audio frames
     socket.on('client_audio_ready', (sessionId) => {
-        console.log(`[Socket.io] 🔊 client_audio_ready for session: ${sessionId}`);
+        serverLog.debug({ sessionId }, 'Client audio ready');
         const resolve = clientReadyResolvers.get(sessionId);
         if (resolve) {
             clientReadyResolvers.delete(sessionId);
@@ -77,333 +95,132 @@ io.on('connection', (socket) => {
         if (socket.data.sessionId) {
             unregisterSocket(socket.data.sessionId);
         }
-        console.log(`[Socket.io] Client disconnected: ${socket.id}`);
+        serverLog.debug({ socketId: socket.id }, 'Client disconnected');
     });
 });
 
-// Middleware
-app.use(cors());
-app.use(express.json());
+// ── Security middleware ──────────────────────────────────────────
+app.use(helmet({
+    contentSecurityPolicy: false, // allow inline scripts in public/index.html
+    crossOriginEmbedderPolicy: false
+}));
+app.use(cors({ origin: allowedOrigins, methods: ['GET', 'POST'] }));
+app.use(express.json({ limit: '5mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Set up multer for PDF uploads
+// ── Rate limiters ────────────────────────────────────────────────
+const apiLimiter = rateLimit({
+    windowMs: 1 * 60 * 1000, // 1 minute
+    max: 60,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many requests, please try again later' }
+});
+
+const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 20,
+    message: { error: 'Too many auth attempts, please try again later' }
+});
+
+const llmLimiter = rateLimit({
+    windowMs: 1 * 60 * 1000, // 1 minute
+    max: 20,
+    message: { error: 'Too many AI requests, please slow down' }
+});
+
+const uploadLimiter = rateLimit({
+    windowMs: 5 * 60 * 1000, // 5 minutes
+    max: 10,
+    message: { error: 'Too many uploads, please try again later' }
+});
+
+// ── Multer ───────────────────────────────────────────────────────
 const uploadDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) {
     fs.mkdirSync(uploadDir);
 }
 
 const storage = multer.diskStorage({
-    destination: function (req, file, cb) {
-        cb(null, 'uploads/')
-    },
-    filename: function (req, file, cb) {
+    destination: (req, file, cb) => cb(null, 'uploads/'),
+    filename: (req, file, cb) => {
         const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-        cb(null, uniqueSuffix + path.extname(file.originalname))
+        cb(null, uniqueSuffix + path.extname(file.originalname));
     }
 });
 
 const upload = multer({
-    storage: storage,
+    storage,
+    limits: { fileSize: 20 * 1024 * 1024 }, // 20MB max
     fileFilter: (req, file, cb) => {
-        if (file.mimetype === 'application/pdf') {
-            cb(null, true);
-        } else {
-            cb(new Error('Only PDF files are allowed!'), false);
-        }
+        if (file.mimetype === 'application/pdf') cb(null, true);
+        else cb(new Error('Only PDF files are allowed!'), false);
     }
 });
 
-const sessionCache = {};
+// ── Global error handler ─────────────────────────────────────────
+function errorHandler(err, req, res, _next) {
+    serverLog.error({ err: err.message, path: req.path }, 'Unhandled error');
+    const status = err.status || 500;
+    res.status(status).json({
+        error: process.env.NODE_ENV === 'production' ? 'Internal server error' : err.message
+    });
+}
 
-// Routes
-app.post('/api/upload', upload.single('pdf'), async (req, res) => {
+// ── Initialize & Start ──────────────────────────────────────────
+async function startServer() {
+    // Initialize the interview agent with PostgresSaver (async)
+    serverLog.info('Initializing interview agent...');
+    let interviewAgent;
     try {
-        if (!req.file) {
-            return res.status(400).json({ error: 'No PDF file uploaded' });
-        }
-
-        console.log(`Received file: ${req.file.filename}`);
-        const sessionId = req.file.filename;
-
-        const text = await extractTextFromPDF(req.file.path);
-        const docs = await splitText(text);
-        const vectorStore = await storeDocuments(docs, sessionId);
-
-        sessionCache[sessionId] = {
-            vectorStore: vectorStore,
-            docs: docs,
-            chatHistory: [],
-            interviewState: null
-        };
-
-        res.json({
-            message: 'PDF processed successfully',
-            sessionId: sessionId
-        });
-
-    } catch (error) {
-        console.error("Upload error:", error);
-        res.status(500).json({ error: error.message || "Failed to process PDF" });
+        interviewAgent = await createInterviewAgent();
+        serverLog.info('Interview agent ready (PostgresSaver)');
+    } catch (err) {
+        serverLog.warn({ err: err.message }, 'PostgresSaver failed, using no checkpointer');
+        interviewAgent = await createInterviewAgent(null);
     }
-});
 
-app.post('/api/quiz', async (req, res) => {
-    try {
-        const { sessionId, topic, numQuestions } = req.body;
+    // ── Routes with rate limiters ────────────────────────────────
+    const deps = { sessionCache, activeAgents, clientReadyResolvers, io, upload, interviewAgent };
 
-        if (!sessionId) {
-            return res.status(400).json({ error: 'Session ID is required' });
-        }
+    app.use('/api/auth', authLimiter);
+    app.use('/api', createAuthRoutes());
 
-        const session = sessionCache[sessionId];
-        if (!session || !session.vectorStore) {
-            return res.status(404).json({ error: 'Session not found or expired. Please upload the PDF again.' });
-        }
-        const vectorStore = session.vectorStore;
+    app.use('/api/upload', uploadLimiter);
+    app.use('/api', createUploadRoutes(deps));
 
-        const quizData = await generateQuiz(vectorStore, {
-            topic: topic || "general",
-            numQuestions: parseInt(numQuestions) || 5
-        });
+    app.use('/api/chat', llmLimiter);
+    app.use('/api', createChatRoutes(deps));
 
-        res.json(quizData);
+    app.use('/api/quiz', llmLimiter);
+    app.use('/api', createQuizRoutes(deps));
 
-    } catch (error) {
-        console.error("Quiz generation error:", error);
-        res.status(500).json({ error: error.message || "Failed to generate quiz" });
-    }
-});
+    app.use('/api/summary', llmLimiter);
+    app.use('/api', createSummaryRoutes(deps));
 
-app.post('/api/summary', async (req, res) => {
-    try {
-        const { sessionId } = req.body;
+    app.use('/api/interview', llmLimiter);
+    app.use('/api', createInterviewRoutes(deps));
 
-        if (!sessionId) {
-            return res.status(400).json({ error: 'Session ID is required' });
-        }
+    app.use('/api', apiLimiter);
+    app.use('/api', createTokenRoutes());
+    app.use('/api', createHistoryRoutes());
+    app.use('/api', createSessionRoutes(deps));
 
-        const session = sessionCache[sessionId];
-        if (!session || !session.docs) {
-            return res.status(404).json({ error: 'Session not found or expired. Please upload the PDF again.' });
-        }
+    // Global error handler (must be last)
+    app.use(errorHandler);
 
-        console.log(`Generating summary for session: ${sessionId}`);
-        const summary = await summarizeDocs(session.docs);
+    // ── Start ────────────────────────────────────────────────────
+    httpServer.listen(PORT, () => {
+        serverLog.info({
+            port: PORT,
+            supabase: !!process.env.SUPABASE_URL,
+            langsmith: process.env.LANGCHAIN_TRACING_V2 === 'true',
+            sessionTTL: `${SESSION_TTL / 60000}min`
+        }, 'Server started');
+    });
+}
 
-        console.log(`Converting summary to audio...`);
-        const audio = await textToAudio(summary);
-
-        res.json({
-            summary: summary,
-            audio: audio
-        });
-
-    } catch (error) {
-        console.error("Summary/TTS error:", error);
-        res.status(500).json({ error: error.message || "Failed to generate summary or audio" });
-    }
-});
-
-app.post('/api/chat', async (req, res) => {
-    try {
-        const { sessionId, question } = req.body;
-
-        if (!sessionId || !question) {
-            return res.status(400).json({ error: 'Session ID and question are required' });
-        }
-
-        const session = sessionCache[sessionId];
-        if (!session || !session.vectorStore) {
-            return res.status(404).json({ error: 'Session not found or expired. Please upload the PDF again.' });
-        }
-
-        console.log(`Chat request: "${question}" for session: ${sessionId}`);
-
-        const answer = await queryRAG(session.vectorStore, question, session.chatHistory);
-
-        session.chatHistory.push(new HumanMessage(question));
-        session.chatHistory.push(new AIMessage(answer));
-
-        if (session.chatHistory.length > 20) {
-            session.chatHistory = session.chatHistory.slice(session.chatHistory.length - 20);
-        }
-
-        res.json({ answer: answer });
-
-    } catch (error) {
-        console.error("Chat error:", error);
-        res.status(500).json({ error: error.message || "Failed to get answer" });
-    }
-});
-
-// ==========================================
-// LiveKit — Token Endpoint
-// ==========================================
-app.post('/api/livekit/token', async (req, res) => {
-    try {
-        const { sessionId } = req.body;
-        if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
-
-        const apiKey    = process.env.LIVEKIT_API_KEY;
-        const apiSecret = process.env.LIVEKIT_API_SECRET;
-        const livekitUrl = process.env.LIVEKIT_URL;
-
-        if (!apiKey || !apiSecret || !livekitUrl) {
-            return res.status(500).json({ error: 'LiveKit environment variables not configured.' });
-        }
-
-        // Each sessionId maps to a LiveKit room — one room per interview
-        const at = new AccessToken(apiKey, apiSecret, {
-            identity: `candidate-${sessionId}`,
-            ttl: '2h',
-        });
-
-        at.addGrant({
-            roomJoin:     true,
-            room:         sessionId,   // room = sessionId (unique per PDF upload)
-            canPublish:   true,        // candidate can send mic audio
-            canSubscribe: true,        // candidate can receive AI audio
-        });
-
-        const token = await at.toJwt();
-        console.log(`[LiveKit] Token generated for session: ${sessionId}`);
-
-        res.json({ token, url: livekitUrl });
-
-    } catch (error) {
-        console.error('[LiveKit] Token generation error:', error);
-        res.status(500).json({ error: error.message || 'Failed to generate LiveKit token' });
-    }
-});
-
-// ==========================================
-// Deepgram — Token Endpoint
-// ==========================================
-app.get('/api/deepgram/token', async (req, res) => {
-    try {
-        const apiKey = process.env.DEEPGRAM_API_KEY;
-        if (!apiKey) {
-            return res.status(500).json({ error: 'DEEPGRAM_API_KEY not configured' });
-        }
-
-        // STT runtime options (configurable from .env)
-        const model = process.env.DEEPGRAM_STT_MODEL || 'nova-3';
-        const language = process.env.DEEPGRAM_STT_LANGUAGE || 'en';
-        const smartFormat = (process.env.DEEPGRAM_STT_SMART_FORMAT || 'true').toLowerCase() === 'true';
-        const interimResults = (process.env.DEEPGRAM_STT_INTERIM_RESULTS || 'true').toLowerCase() === 'true';
-        const endpointing = parseInt(process.env.DEEPGRAM_STT_ENDPOINTING_MS || '500', 10);
-
-        // Simplified: returns API key as token for browser websocket auth.
-        // For stricter production security, replace with short-lived project keys/proxy.
-        res.json({
-            token: apiKey,
-            stt: {
-                model,
-                language,
-                smart_format: smartFormat,
-                interim_results: interimResults,
-                endpointing: Number.isFinite(endpointing) ? endpointing : 500,
-                encoding: 'linear16',
-                sample_rate: 16000,
-                channels: 1
-            }
-        });
-    } catch (error) {
-        console.error('[Deepgram] Token generation error:', error);
-        res.status(500).json({ error: 'Failed to retrieve Deepgram token' });
-    }
-});
-
-// ==========================================
-// AI Voice Interview Routes
-// ==========================================
-
-const interviewAgent = createInterviewAgent();
-
-app.post('/api/interview/start', async (req, res) => {
-    try {
-        const { sessionId, maxQuestions = 5 } = req.body;
-        if (!sessionId) return res.status(400).json({ error: 'Session ID is required' });
-
-        const session = sessionCache[sessionId];
-        if (!session || !session.vectorStore) {
-            return res.status(404).json({ error: 'Session not found. Please upload the PDF again.' });
-        }
-
-        console.log(`Starting interview for session: ${sessionId}`);
-
-        registerVectorStore(sessionId, session.vectorStore);
-
-        const initialState = {
-            sessionId: sessionId,
-            maxQuestions: parseInt(maxQuestions),
-            difficultyLevel: "medium",
-            chatHistory: [],
-            questionsAsked: 0,
-            topicsUsed: []
-        };
-
-        const config = { configurable: { thread_id: sessionId } };
-        const resultState = await interviewAgent.invoke(initialState, config);
-
-        session.interviewStateConfig = config;
-
-        // Start the Agent Worker in the background
-        if (activeAgents.has(sessionId)) {
-            const oldAgent = activeAgents.get(sessionId);
-            oldAgent.stop();
-        }
-        
-        const agent = new InterviewAgentWorker(sessionId, sessionCache, interviewAgent, io);
-        activeAgents.set(sessionId, agent);
-        
-        // Let agent connect to LiveKit, then wait for the browser to signal it is
-        // subscribed and its WebRTC ICE pathway is fully open before speaking.
-        // This replaces the blind setTimeout and prevents audio frames being dropped.
-        agent.start().then(async () => {
-            const { uniquePart } = parseTTSResponse(resultState.currentQuestion);
-            // Tell the UI the question text immediately
-            io.to(sessionId).emit('transcript_final', { role: 'ai', text: uniquePart });
-
-            // Wait for client_audio_ready signal (or fall back after 10s)
-            console.log(`[Agent] Waiting for client audio ready signal for: ${sessionId}`);
-            await new Promise((resolve) => {
-                clientReadyResolvers.set(sessionId, resolve);
-                // 10-second safety fallback in case the signal is never received
-                setTimeout(() => {
-                    if (clientReadyResolvers.has(sessionId)) {
-                        console.warn(`[Agent] client_audio_ready timeout — speaking anyway for: ${sessionId}`);
-                        clientReadyResolvers.delete(sessionId);
-                        resolve();
-                    }
-                }, 10000);
-            });
-
-            console.log(`[Agent] Client ready — speaking first question for: ${sessionId}`);
-            await agent.speak("Hello! Welcome to your AI voice interview. " + uniquePart);
-        }).catch(err => {
-            console.error("[Agent Start Error]", err);
-        });
-
-        // Simplified response, audio is handled via LiveKit now
-        res.json({
-            questionNumber: resultState.questionsAsked,
-            difficulty: resultState.difficultyLevel,
-            agentStarted: true
-        });
-
-    } catch (error) {
-        console.error("Interview start error:", error);
-        res.status(500).json({ error: error.message || "Failed to start interview" });
-    }
-});
-
-// No longer needed, agent handles this internally via SessionBridge
-
-// Start the server
-httpServer.listen(PORT, () => {
-    console.log(`\n========================================`);
-    console.log(`🚀 Quiz Server running on http://localhost:${PORT}`);
-    console.log(`🔌 Socket.io streaming enabled`);
-    console.log(`========================================\n`);
+startServer().catch(err => {
+    serverLog.fatal({ err: err.message }, 'Fatal startup error');
+    process.exit(1);
 });

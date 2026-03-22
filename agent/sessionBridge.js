@@ -1,4 +1,4 @@
-import { interviewStateChannels } from "../lib/interviewAgent.js";
+import { interviewStateChannels } from "../lib/interview/interviewAgent.js";
 import { HumanMessage, AIMessage } from "@langchain/core/messages";
 
 /**
@@ -36,7 +36,12 @@ export class SessionBridge {
             nextQuestion: isDone ? null : resultState.currentQuestion,
             finalReport: resultState.finalReport,
             difficulty: resultState.difficultyLevel,
-            questionNumber: resultState.questionsAsked
+            questionNumber: resultState.questionsAsked,
+            // Pass through for DB persistence
+            questionsAsked: resultState.questionsAsked,
+            scores: resultState.scores,
+            topicScores: resultState.topicScores,
+            difficultyLevel: resultState.difficultyLevel
         };
     }
 }

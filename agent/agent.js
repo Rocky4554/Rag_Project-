@@ -4,9 +4,9 @@ import dotenv from "dotenv";
 
 import { DeepgramSTT } from "./stt.js";
 import { AudioPublisher } from "./audioPublisher.js";
-import { generatePCM } from "./tts.js";
+import { generatePCM, generatePCMPipelined } from "./tts.js";
 import { SessionBridge } from "./sessionBridge.js";
-import { parseTTSResponse } from "../lib/interviewAgent.js";
+import { parseTTSResponse } from "../lib/interview/interviewAgent.js";
 
 // Spoken text for cached TTS phrase keys.
 // The LLM emits tags like [great_answer] which parseTTSResponse strips out.
@@ -75,14 +75,15 @@ export class InterviewAgentWorker {
      */
     constructor(sessionId, sessionCache, agentWorkflow, io) {
         this.sessionId = sessionId;
+        this.sessionCache = sessionCache;
         this.sessionBridge = new SessionBridge(sessionId, sessionCache, agentWorkflow);
         this.io = io;
-        
+
         this.room = new Room();
         this.stt = new DeepgramSTT();
         // Polly PCM is most reliable at 16kHz; publish the same rate to LiveKit source.
         this.audioPublisher = new AudioPublisher(16000, 1);
-        
+
         this.isActive = false;
         this.processingTurn = false;
     }
@@ -90,14 +91,14 @@ export class InterviewAgentWorker {
     async start() {
         console.log(`[AgentWorker] Starting for session: ${this.sessionId}`);
 
-        // 1. Generate token for the AI agent (toJwt() is async in newer livekit-server-sdk)
-        const token = await this.generateToken();
-
-        // 2. Connect STT
+        // 1. Start STT connection early (non-blocking WebSocket handshake)
         this.stt.start();
 
-        // 3. Connect to LiveKit Room
+        // 2. Generate token + setup room events in parallel
+        const token = await this.generateToken();
         this.setupRoomEvents();
+
+        // 3. Connect to LiveKit Room
         await this.room.connect(process.env.LIVEKIT_URL, token);
         console.log(`[AgentWorker] Connected to room: ${this.sessionId}`);
 
@@ -204,8 +205,19 @@ export class InterviewAgentWorker {
                     this.io.to(this.sessionId).emit('interview_done', { report: result.finalReport });
                 }
 
-                const pcm = await generatePCM("Thank you for your time. The interview is now complete. You can review your report on the screen.");
-                if (pcm) await this._playAudio(pcm);
+                // Save interview results to DB via the callback set in routes/interview.js
+                const session = this.sessionCache[this.sessionId];
+                if (session?._onInterviewComplete) {
+                    try {
+                        await session._onInterviewComplete(result);
+                    } catch (err) {
+                        console.error(`[AgentWorker] Failed to save interview result:`, err.message);
+                    }
+                }
+
+                for await (const { pcm } of generatePCMPipelined("Thank you for your time. The interview is now complete. You can review your report on the screen.", "16000")) {
+                    await this._playAudio(pcm);
+                }
 
                 setTimeout(() => this.stop(), 2000);
             } else {
@@ -215,19 +227,35 @@ export class InterviewAgentWorker {
                     this.io.to(this.sessionId).emit('ai_state', { state: 'speaking', text: 'AI Speaking...' });
                 }
 
-                // Parse TTS tags and build full spoken text (phrase text + unique part)
+                // Parse TTS tags
                 const parsedFeedback = parseTTSResponse(result.evaluation.feedback || "");
                 const parsedQuestion = parseTTSResponse(result.nextQuestion || "");
 
                 const feedbackPhrases = (parsedFeedback.phraseKeys || []).map(k => PHRASE_TEXT[k] || "").join(" ");
                 const questionPhrases = (parsedQuestion.phraseKeys || []).map(k => PHRASE_TEXT[k] || "").join(" ");
 
-                const spokenText = `${feedbackPhrases} ${parsedFeedback.uniquePart} ${questionPhrases} ${parsedQuestion.uniquePart}`.replace(/\s+/g, " ").trim();
+                // Build two parts: short feedback phrase + longer question text
+                const feedbackText = `${feedbackPhrases} ${parsedFeedback.uniquePart}`.trim();
+                const questionText = `${questionPhrases} ${parsedQuestion.uniquePart}`.trim();
 
-                if (spokenText) {
-                    const pcmData = await generatePCM(spokenText, "16000");
-                    if (pcmData) {
-                        await this._playAudio(pcmData);
+                // Play feedback phrase first (short, fast TTS) while question TTS generates
+                if (feedbackText && questionText) {
+                    // Start question TTS generation in background while we play feedback
+                    const questionTTSPromise = generatePCM(questionText, "16000");
+
+                    // Play short feedback immediately
+                    const feedbackPcm = await generatePCM(feedbackText, "16000");
+                    if (feedbackPcm) await this._playAudio(feedbackPcm);
+
+                    // Question PCM should be ready by now (or soon)
+                    const questionPcm = await questionTTSPromise;
+                    if (questionPcm) await this._playAudio(questionPcm);
+                } else {
+                    const spokenText = `${feedbackText} ${questionText}`.trim();
+                    if (spokenText) {
+                        for await (const { pcm } of generatePCMPipelined(spokenText, "16000")) {
+                            await this._playAudio(pcm);
+                        }
                     }
                 }
 
@@ -265,12 +293,10 @@ export class InterviewAgentWorker {
             const fullText = `${phrases} ${parsed.uniquePart}`.replace(/\s+/g, " ").trim();
 
             if (fullText) {
-                console.log(`[AgentWorker] Speaking: "${fullText.substring(0, 80)}..."`);
-                const pcm = await generatePCM(fullText, "16000");
-                if (pcm) {
+                console.log(`[AgentWorker] Speaking (pipelined): "${fullText.substring(0, 80)}..."`);
+                // Stream sentence-by-sentence: play first sentence ASAP while rest generates
+                for await (const { pcm } of generatePCMPipelined(fullText, "16000")) {
                     await this._playAudio(pcm);
-                } else {
-                    console.error(`[AgentWorker] TTS returned null — Polly may have failed. Check AWS credentials/region.`);
                 }
             }
         } catch (err) {

@@ -4,7 +4,29 @@
       "Bash(timeout 10 node -e \"const m = await import\\(''@livekit/rtc-node''\\); const src = new m.AudioSource\\(16000, 1\\); const proto = Object.getPrototypeOf\\(src\\); console.log\\(Object.getOwnPropertyNames\\(proto\\)\\); console.log\\(proto.captureFrame.toString\\(\\).substring\\(0, 400\\)\\); process.exit\\(0\\);\")",
       "Bash(powershell -Command \"Get-ItemProperty 'HKLM:\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Uninstall\\\\*','HKLM:\\\\Software\\\\WOW6432Node\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Uninstall\\\\*','HKCU:\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Uninstall\\\\*' 2>$null | Where-Object { $_.DisplayName -like '*amp*' } | Select-Object DisplayName,InstallDate,UninstallString | Format-List\")",
       "Bash(powershell -Command \"Get-ItemProperty 'HKLM:\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Uninstall\\\\*','HKLM:\\\\Software\\\\WOW6432Node\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Uninstall\\\\*','HKCU:\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Uninstall\\\\*' -ErrorAction SilentlyContinue | Where-Object { \\\\$_.DisplayName -like '*amp*' } | Select-Object DisplayName,InstallDate,UninstallString | Format-List\")",
-      "Bash(powershell -Command \"Get-ItemProperty 'HKLM:\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Uninstall\\\\*','HKLM:\\\\Software\\\\WOW6432Node\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Uninstall\\\\*','HKCU:\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Uninstall\\\\*' -ErrorAction SilentlyContinue | Where-Object { \\\\$_.DisplayName -like '*time*champ*' -or \\\\$_.DisplayName -like '*timechamp*' } | Select-Object DisplayName,InstallDate,InstallLocation,UninstallString | Format-List\")"
+      "Bash(powershell -Command \"Get-ItemProperty 'HKLM:\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Uninstall\\\\*','HKLM:\\\\Software\\\\WOW6432Node\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Uninstall\\\\*','HKCU:\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Uninstall\\\\*' -ErrorAction SilentlyContinue | Where-Object { \\\\$_.DisplayName -like '*time*champ*' -or \\\\$_.DisplayName -like '*timechamp*' } | Select-Object DisplayName,InstallDate,InstallLocation,UninstallString | Format-List\")",
+      "Bash(node --check server.js)",
+      "Bash(node --check lib/supabase.js)",
+      "Bash(node --check lib/db.js)",
+      "Bash(node --check middleware/auth.js)",
+      "Bash(node --check routes/auth.js)",
+      "Bash(node --check routes/history.js)",
+      "Bash(node --check routes/upload.js)",
+      "Bash(node --check routes/chat.js)",
+      "Bash(node --check routes/quiz.js)",
+      "Bash(node --check routes/summary.js)",
+      "Bash(node --check routes/interview.js)",
+      "Bash(grep -r \"import.*chroma\\\\|require.*chroma\" '/e/Personal Projects/Rag/rag_project' --include=*.js)",
+      "Bash(npm uninstall:*)",
+      "Bash(cd:*)",
+      "Bash(node --check index.js)",
+      "Bash(node --check lib/logger.js)",
+      "Bash(node --check lib/validation.js)",
+      "Bash(node --check lib/env.js)",
+      "Bash(node --check lib/pipeline/vectorStore.js)",
+      "Bash(find 'E:\\\\Personal Projects\\\\Rag\\\\rag-frontend\\\\app' -type f -name *.jsx -o -name *.js -o -name *.tsx -o -name *.ts)",
+      "Bash(find 'E:\\\\Personal Projects\\\\Rag\\\\rag-frontend' -name *.md -o -name .env*)",
+      "Bash(npx next:*)"
     ]
   }
 }

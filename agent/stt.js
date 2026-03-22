@@ -16,7 +16,7 @@ export class DeepgramSTT extends EventEmitter {
         this.model = process.env.DEEPGRAM_STT_MODEL || "nova-3";
         this.language = process.env.DEEPGRAM_STT_LANGUAGE || "en";
         this.smartFormat = (process.env.DEEPGRAM_STT_SMART_FORMAT || "true") === "true";
-        this.endpointing = parseInt(process.env.DEEPGRAM_STT_ENDPOINTING_MS || "500", 10);
+        this.endpointing = parseInt(process.env.DEEPGRAM_STT_ENDPOINTING_MS || "300", 10);
 
         this.currentTranscript = "";
     }
