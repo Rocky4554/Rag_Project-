@@ -377,6 +377,17 @@
             text-align: center;
         }
 
+        /* Typewriter cursor */
+        .iv-bubble.streaming::after {
+            content: '▌';
+            animation: blink-cursor 0.6s step-end infinite;
+            color: var(--text-secondary);
+            margin-left: 1px;
+        }
+        @keyframes blink-cursor {
+            50% { opacity: 0; }
+        }
+
         .iv-report {
             margin-top: 1.5rem;
             padding: 1.5rem;
@@ -848,6 +859,11 @@
             lbl.textContent = label;
         }
 
+        // ── Streaming typewriter state ──
+        let _streamBubble = null;   // current AI bubble being streamed into
+        let _streamText = '';       // accumulated text for current stream
+        let _streamEndedAt = 0;     // timestamp when last stream ended (debounce duplicate)
+
         function ivAddLine(role, text) {
             // role: 'ai' | 'user'
             const box = document.getElementById('iv-transcript');
@@ -855,10 +871,64 @@
             line.className = 'iv-line ' + role;
             const bubble = document.createElement('div');
             bubble.className = 'iv-bubble';
-            bubble.innerHTML = text.replace(/\n/g, '<br>');
+            line.appendChild(bubble);
+            box.appendChild(line);
+
+            if (role === 'user') {
+                // Typewriter effect for user transcript
+                _typewriterEffect(bubble, text, 18);
+            } else {
+                bubble.innerHTML = text.replace(/\n/g, '<br>');
+            }
+            box.scrollTop = box.scrollHeight;
+        }
+
+        function ivStartStreamBubble() {
+            // Create a new AI bubble for streaming tokens into
+            const box = document.getElementById('iv-transcript');
+            const line = document.createElement('div');
+            line.className = 'iv-line ai';
+            const bubble = document.createElement('div');
+            bubble.className = 'iv-bubble streaming';
             line.appendChild(bubble);
             box.appendChild(line);
             box.scrollTop = box.scrollHeight;
+            _streamBubble = bubble;
+            _streamText = '';
+        }
+
+        function ivAppendStreamToken(token) {
+            if (!_streamBubble) ivStartStreamBubble();
+            _streamText += token;
+            _streamBubble.innerHTML = _streamText.replace(/\n/g, '<br>');
+            const box = document.getElementById('iv-transcript');
+            box.scrollTop = box.scrollHeight;
+        }
+
+        function ivEndStream() {
+            if (_streamBubble) {
+                _streamBubble.classList.remove('streaming');
+                _streamBubble = null;
+                _streamText = '';
+                _streamEndedAt = Date.now();
+            }
+        }
+
+        function _typewriterEffect(el, text, charDelay) {
+            let i = 0;
+            el.classList.add('streaming');
+            function tick() {
+                if (i < text.length) {
+                    el.textContent += text[i];
+                    i++;
+                    const box = document.getElementById('iv-transcript');
+                    box.scrollTop = box.scrollHeight;
+                    setTimeout(tick, charDelay);
+                } else {
+                    el.classList.remove('streaming');
+                }
+            }
+            tick();
         }
 
         function ivSetInterim(text) {
@@ -1153,8 +1223,26 @@
                 ivSetState(state, text);
             });
 
+            // ── AI text streaming (typewriter token-by-token) ──
+            socket.on('ai_stream', ({ token, type }) => {
+                ivAppendStreamToken(token);
+            });
+
+            socket.on('ai_stream_end', ({ type }) => {
+                ivEndStream();
+            });
+
             socket.on('transcript_final', ({ role, text }) => {
-                ivAddLine(role, text);
+                if (role === 'user') {
+                    ivAddLine('user', text);
+                } else {
+                    // AI: skip if stream already displayed this question
+                    // (ai_stream tokens already rendered it, or just finished)
+                    const recentStream = (Date.now() - _streamEndedAt) < 2000;
+                    if (!_streamBubble && !recentStream) {
+                        ivAddLine('ai', text);
+                    }
+                }
             });
 
             socket.on('interview_done', ({ report }) => {
