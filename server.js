@@ -11,7 +11,7 @@ import { createServer } from 'http';
 import { Server as SocketIOServer } from 'socket.io';
 
 import { validateEnv, printEnvStatus } from './lib/env.js';
-import { serverLog } from './lib/logger.js';
+import { serverLog, httpLogger } from './lib/logger.js';
 import { registerSocket, unregisterSocket, createInterviewAgent } from "./lib/interview/interviewAgent.js";
 import { createUploadRoutes } from './routes/upload.js';
 import { createChatRoutes } from './routes/chat.js';
@@ -110,6 +110,7 @@ app.use(helmet({
 app.use(cors({ origin: allowedOrigins, methods: ['GET', 'POST'], credentials: true }));
 app.use(cookieParser());
 app.use(express.json({ limit: '5mb' }));
+app.use(httpLogger);
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ── Rate limiters ────────────────────────────────────────────────

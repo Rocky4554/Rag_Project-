@@ -237,6 +237,13 @@
             border-bottom-left-radius: 2px;
         }
 
+        .chat-message.streaming::after {
+            content: '▌';
+            animation: blink-cursor 0.6s step-end infinite;
+            color: var(--text-secondary);
+            margin-left: 1px;
+        }
+
         .chat-input-group {
             display: flex;
             gap: 0.5rem;
@@ -805,20 +812,52 @@
             status.className = 'status-msg';
 
             try {
-                const res = await fetch('/api/chat', {
+                const res = await fetch('/api/chat/stream', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ sessionId, question })
                 });
 
-                const data = await res.json();
-
                 if (!res.ok) {
+                    const data = await res.json();
                     throw new Error(data.error || "Failed to get answer");
                 }
 
-                addMessageToChat(data.answer, 'chat-ai');
+                // Create AI bubble for streaming
+                const aiBubble = createChatBubble('chat-ai streaming');
                 status.textContent = '';
+
+                const reader = res.body.getReader();
+                const decoder = new TextDecoder();
+                let fullText = '';
+                let buffer = '';
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop(); // keep incomplete line in buffer
+
+                    for (const line of lines) {
+                        if (!line.startsWith('data: ')) continue;
+                        let payload;
+                        try {
+                            payload = JSON.parse(line.slice(6));
+                        } catch (e) { continue; } // skip malformed JSON
+                        if (payload.error) throw new Error(payload.error);
+                        if (payload.done) break;
+                        if (payload.token) {
+                            fullText += payload.token;
+                            aiBubble.innerHTML = fullText.replace(/\n/g, '<br>');
+                            history.scrollTop = history.scrollHeight;
+                        }
+                    }
+                }
+
+                aiBubble.classList.remove('streaming');
+
             } catch (err) {
                 status.textContent = err.message;
                 status.className = 'status-msg error-msg';
@@ -830,14 +869,18 @@
             }
         }
 
-        function addMessageToChat(text, cssClass) {
+        function createChatBubble(cssClass) {
             const history = document.getElementById('chat-history');
             const msgDiv = document.createElement('div');
             msgDiv.className = `chat-message ${cssClass}`;
-            // Convert simple markdown-like newlines to breaks
-            msgDiv.innerHTML = text.replace(/\n/g, '<br>');
             history.appendChild(msgDiv);
             history.scrollTop = history.scrollHeight;
+            return msgDiv;
+        }
+
+        function addMessageToChat(text, cssClass) {
+            const bubble = createChatBubble(cssClass);
+            bubble.innerHTML = text.replace(/\n/g, '<br>');
         }
 
         // ═══════════════════════════════════════════
