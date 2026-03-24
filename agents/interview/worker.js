@@ -30,41 +30,29 @@ const PHRASE_TEXT = {
     "out_of_context":    "Let's stay on topic.",
 };
 
+// Improvement #5: Barge-in threshold — average absolute amplitude above which
+// we treat incoming audio as intentional speech, not background noise.
+// Int16 range is ±32767. 400 ≈ 1.2% of max — quiet speech is ~1000+.
+const BARGE_IN_AMPLITUDE_THRESHOLD = 400;
+
+// Improvement #5: Minimum word count for a barge-in to be processed.
+// Prevents single-word noise ("Hmm") from interrupting long AI responses.
+const BARGE_IN_MIN_WORDS = 3;
+
 dotenv.config();
 
 /**
- * Wraps raw 16-bit PCM in a minimal WAV header so the browser can play it
- * via a simple <audio> element. Returns a base64-encoded WAV string.
+ * Returns true if the Int16Array contains audio that is louder than
+ * background noise — used to gate barge-in audio forwarding to STT.
  */
-function pcmToWavBase64(pcmInt16, sampleRate = 16000, channels = 1) {
-    const bytesPerSample = 2;
-    const dataSize = pcmInt16.length * bytesPerSample;
-    const buffer = Buffer.alloc(44 + dataSize);
-
-    // RIFF header
-    buffer.write("RIFF", 0);
-    buffer.writeUInt32LE(36 + dataSize, 4);
-    buffer.write("WAVE", 8);
-
-    // fmt chunk
-    buffer.write("fmt ", 12);
-    buffer.writeUInt32LE(16, 16);               // chunk size
-    buffer.writeUInt16LE(1, 20);                // PCM format
-    buffer.writeUInt16LE(channels, 22);
-    buffer.writeUInt32LE(sampleRate, 24);
-    buffer.writeUInt32LE(sampleRate * channels * bytesPerSample, 28); // byte rate
-    buffer.writeUInt16LE(channels * bytesPerSample, 32);              // block align
-    buffer.writeUInt16LE(16, 34);               // bits per sample
-
-    // data chunk
-    buffer.write("data", 36);
-    buffer.writeUInt32LE(dataSize, 40);
-
-    // Copy PCM samples
-    const pcmBuf = Buffer.from(pcmInt16.buffer, pcmInt16.byteOffset, dataSize);
-    pcmBuf.copy(buffer, 44);
-
-    return buffer.toString("base64");
+function hasSignificantAudio(int16Array) {
+    if (!int16Array || int16Array.length === 0) return false;
+    let sum = 0;
+    // Sample every 4th value for performance on large buffers
+    for (let i = 0; i < int16Array.length; i += 4) {
+        sum += Math.abs(int16Array[i]);
+    }
+    return (sum / Math.ceil(int16Array.length / 4)) > BARGE_IN_AMPLITUDE_THRESHOLD;
 }
 
 export class InterviewAgentWorker {
@@ -87,6 +75,10 @@ export class InterviewAgentWorker {
 
         this.isActive = false;
         this.processingTurn = false;
+
+        // Improvement #4: track when AI last finished speaking so we can compute
+        // timeToAnswer = elapsed since AI finished → user's STT transcript received
+        this.aiStoppedSpeakingAt = 0;
     }
 
     async start() {
@@ -152,17 +144,55 @@ export class InterviewAgentWorker {
             this.stop();
         });
 
-        // Handle full transcript from STT
-        this.stt.on("transcript", async (text) => {
-            if (!this.isActive || this.processingTurn) return;
+        // STT now emits an object: { transcript, utteranceDurationMs, fillerWordCount }
+        this.stt.on("transcript", async ({ transcript: text, utteranceDurationMs, fillerWordCount }) => {
+            if (!this.isActive) return;
 
-            // Basic VAD: don't process if the AI is currently speaking
+            // Improvement #5: Barge-in — user spoke while AI was still talking
             if (this.audioPublisher.isSpeaking) {
-                agentLog.debug({ sessionId: this.sessionId }, 'Ignored transcript (AI is speaking)');
+                const wordCount = text.trim().split(/\s+/).filter(w => w).length;
+                if (wordCount >= BARGE_IN_MIN_WORDS) {
+                    agentLog.info({
+                        sessionId: this.sessionId,
+                        transcript: text.substring(0, 80),
+                        wordCount,
+                    }, '🎤 Barge-in detected — interrupting AI');
+
+                    // Stop AI audio immediately (AudioPublisher.stop() sets stopFlag=true
+                    // which breaks the pushPCM loop on the very next 10ms chunk)
+                    this.audioPublisher.stop();
+
+                    // Brief pause to let the audio subsystem settle before we re-speak
+                    await new Promise(r => setTimeout(r, 120));
+
+                    const timeToAnswer = this.aiStoppedSpeakingAt > 0
+                        ? Date.now() - this.aiStoppedSpeakingAt
+                        : 0;
+
+                    await this.handleUserTurn(text, {
+                        utteranceDurationMs,
+                        fillerWordCount,
+                        timeToAnswer,
+                        bargedIn: true,
+                    });
+                } else {
+                    agentLog.debug({ sessionId: this.sessionId, wordCount }, 'Ignored short transcript during AI speech');
+                }
                 return;
             }
 
-            await this.handleUserTurn(text);
+            if (this.processingTurn) return;
+
+            const timeToAnswer = this.aiStoppedSpeakingAt > 0
+                ? Date.now() - this.aiStoppedSpeakingAt
+                : 0;
+
+            await this.handleUserTurn(text, {
+                utteranceDurationMs,
+                fillerWordCount,
+                timeToAnswer,
+                bargedIn: false,
+            });
         });
     }
 
@@ -174,10 +204,17 @@ export class InterviewAgentWorker {
         (async () => {
             try {
                 for await (const frame of audioStream) {
-                    // Only forward audio to STT when the agent is idle
-                    if (!this.processingTurn && !this.audioPublisher.isSpeaking) {
-                        if (frame.data) {
+                    if (frame.data) {
+                        if (!this.processingTurn && !this.audioPublisher.isSpeaking) {
+                            // Normal listening — forward all audio to STT
                             this.stt.pushAudio(frame.data);
+                        } else if (this.audioPublisher.isSpeaking) {
+                            // Improvement #5: Barge-in — forward audio only when above noise floor.
+                            // This lets Deepgram detect the user speaking while AI is talking
+                            // without flooding it with silence/background noise frames.
+                            if (hasSignificantAudio(frame.data)) {
+                                this.stt.pushAudio(frame.data);
+                            }
                         }
                     }
                 }
@@ -188,11 +225,23 @@ export class InterviewAgentWorker {
         })();
     }
 
-    async handleUserTurn(transcript) {
+    /**
+     * @param {string} transcript - The STT-transcribed user speech
+     * @param {Object} acousticMeta - Behavioral context from STT/WebRTC layer
+     */
+    async handleUserTurn(transcript, acousticMeta = {}) {
         const turnStart = performance.now();
         this.processingTurn = true;
 
-        agentLog.info({ sessionId: this.sessionId, transcript: transcript.substring(0, 150), words: transcript.trim().split(/\s+/).length }, '🎤 User said');
+        agentLog.info({
+            sessionId: this.sessionId,
+            transcript: transcript.substring(0, 150),
+            words: transcript.trim().split(/\s+/).length,
+            utteranceDurationMs: acousticMeta.utteranceDurationMs || 0,
+            fillerWordCount: acousticMeta.fillerWordCount || 0,
+            timeToAnswer: acousticMeta.timeToAnswer || 0,
+            bargedIn: acousticMeta.bargedIn || false,
+        }, '🎤 User said');
 
         // Notify UI that we heard something
         if (this.io) {
@@ -201,10 +250,10 @@ export class InterviewAgentWorker {
         }
 
         try {
-            // 1. Process via LangGraph
-            const result = await this.sessionBridge.processUserTranscript(transcript);
+            // 1. Process via LangGraph (pass acoustic metadata for behavioral context)
+            const result = await this.sessionBridge.processUserTranscript(transcript, acousticMeta);
             const processMs = Math.round(performance.now() - turnStart);
-            agentLog.info({ sessionId: this.sessionId, processMs, done: result.done }, 'User turn processed');
+            agentLog.info({ sessionId: this.sessionId, processMs, intent: result.intent, done: result.done }, 'User turn processed');
 
             if (!result.done && result.evaluation) {
                 agentLog.info({
@@ -228,11 +277,19 @@ export class InterviewAgentWorker {
                 });
             }
 
-            // Intents fully handled inside handleEdgeCaseNode — speak feedback only, no next question
+            // ── Improvement #1 & #2: New intent routing in worker ──────────────────
+
+            // Intents fully handled inside handleEdgeCaseNode — speak feedback only
             const FEEDBACK_ONLY_INTENTS = ['confused', 'meta', 'irrelevant'];
 
+            // Improvement #1: backchannel — candidate is thinking out loud, don't evaluate
+            const THINKING_INTENTS = ['thinking_out_loud'];
+
+            // Improvement #1: premature STT cutoff — wait silently for more speech
+            const CUTOFF_INTENTS = ['premature_cutoff'];
+
             if (result.done) {
-                // Interview over
+                // ── Interview complete ─────────────────────────────────────────────
                 if (this.io) {
                     this.io.to(this.sessionId).emit('interview_done', {
                         report: result.finalReport,
@@ -257,8 +314,38 @@ export class InterviewAgentWorker {
                 }
 
                 setTimeout(() => this.stop(), 2000);
+
+            } else if (CUTOFF_INTENTS.includes(result.intent)) {
+                // ── Premature STT cutoff — say nothing, just keep listening ────────
+                // The candidate's sentence was cut off mid-thought. 700ms endpointing
+                // greatly reduces this, but when it does happen we simply wait for more.
+                agentLog.info({ sessionId: this.sessionId }, 'Premature cutoff — waiting for more speech');
+                if (this.io) {
+                    this.io.to(this.sessionId).emit('ai_state', { state: 'listening', text: 'Please continue...' });
+                }
+
+            } else if (THINKING_INTENTS.includes(result.intent)) {
+                // ── Thinking out loud — acknowledge briefly and wait ────────────────
+                // Candidate is mid-thought. Speak a short backchannel phrase so they know
+                // we're listening, then go back to listening without advancing question state.
+                const rawFeedback = result.evaluation?.feedback || "[take_your_time]";
+                const parsed = parseTTSResponse(rawFeedback);
+                const phrases = (parsed.phraseKeys || []).map(k => PHRASE_TEXT[k] || "").join(" ");
+                const spokenText = (`${phrases} ${parsed.uniquePart}`).trim() || "Take your time.";
+
+                agentLog.info({ sessionId: this.sessionId, spoken: spokenText }, 'Backchannel — thinking out loud');
+                if (this.io) {
+                    this.io.to(this.sessionId).emit('ai_state', { state: 'speaking', text: 'AI Speaking...' });
+                }
+                for await (const { pcm } of generatePCMPipelined(spokenText, "16000")) {
+                    await this._playAudio(pcm);
+                }
+                if (this.io) {
+                    this.io.to(this.sessionId).emit('ai_state', { state: 'listening', text: 'Your turn...' });
+                }
+
             } else if (FEEDBACK_ONLY_INTENTS.includes(result.intent)) {
-                // confused / meta / irrelevant — speak only the feedback response, no new question
+                // ── confused / meta / irrelevant — speak response, stay on same question ──
                 const feedbackText = result.evaluation?.feedback || "";
                 if (this.io) {
                     this.io.to(this.sessionId).emit('transcript_final', { role: 'ai', text: feedbackText });
@@ -272,15 +359,16 @@ export class InterviewAgentWorker {
                 if (this.io) {
                     this.io.to(this.sessionId).emit('ai_state', { state: 'listening', text: 'Your turn to speak...' });
                 }
+
             } else {
-                // Next question
+                // ── Next question — speak feedback phrase + new question ────────────
                 if (this.io) {
                     this.io.to(this.sessionId).emit('transcript_final', { role: 'ai', text: result.nextQuestion });
                     this.io.to(this.sessionId).emit('ai_state', { state: 'speaking', text: 'AI Speaking...' });
                 }
 
                 // Parse TTS tags
-                const parsedFeedback = parseTTSResponse(result.evaluation.feedback || "");
+                const parsedFeedback = parseTTSResponse(result.evaluation?.feedback || "");
                 const parsedQuestion = parseTTSResponse(result.nextQuestion || "");
 
                 const feedbackPhrases = (parsedFeedback.phraseKeys || []).map(k => PHRASE_TEXT[k] || "").join(" ");
@@ -337,16 +425,15 @@ export class InterviewAgentWorker {
     }
 
     /**
-     * Can be called manually to make the agent speak (e.g. for the very first question)
-     */
-    /**
-     * Sends PCM audio via both LiveKit (WebRTC) and Socket.io (WAV fallback).
-     * The client plays whichever path is available.
+     * Sends PCM audio via both LiveKit (WebRTC) and records when AI finished speaking.
+     * Improvement #4: aiStoppedSpeakingAt timestamp is used to compute timeToAnswer.
      */
     async _playAudio(pcm) {
         if (!pcm) return;
         // LiveKit WebRTC — primary audio path
         await this.audioPublisher.pushPCM(pcm);
+        // Record when AI last finished a chunk — used to compute timeToAnswer
+        this.aiStoppedSpeakingAt = Date.now();
     }
 
     async speak(text) {

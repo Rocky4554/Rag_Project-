@@ -16,18 +16,33 @@ export class SessionBridge {
 
     /**
      * Called when the STT emits a final user transcript.
+     * acousticMeta = { utteranceDurationMs, fillerWordCount, timeToAnswer, bargedIn }
      * Invokes your LangGraph agent directly.
      */
-    async processUserTranscript(transcript) {
+    async processUserTranscript(transcript, acousticMeta = {}) {
         const session = this.sessionCache[this.sessionId];
         if (!session || !session.interviewStateConfig) {
             throw new Error("Session not found or interview not started.");
         }
 
         const start = performance.now();
-        agentLog.info({ sessionId: this.sessionId, transcriptLength: transcript.length }, 'SessionBridge processing transcript');
+        agentLog.info({
+            sessionId: this.sessionId,
+            transcriptLength: transcript.length,
+            utteranceDurationMs: acousticMeta.utteranceDurationMs || 0,
+            fillerWordCount: acousticMeta.fillerWordCount || 0,
+            timeToAnswer: acousticMeta.timeToAnswer || 0,
+            bargedIn: acousticMeta.bargedIn || false,
+        }, 'SessionBridge processing transcript');
 
-        const inputState = { userAnswer: transcript };
+        // Improvement #4: inject acoustic behavioral context into LangGraph state
+        const inputState = {
+            userAnswer: transcript,
+            utteranceDurationMs: acousticMeta.utteranceDurationMs || 0,
+            fillerWordCount: acousticMeta.fillerWordCount || 0,
+            timeToAnswer: acousticMeta.timeToAnswer || 0,
+            bargedIn: acousticMeta.bargedIn || false,
+        };
         const resultState = await this.agentWorkflow.invoke(inputState, session.interviewStateConfig);
         const durationMs = Math.round(performance.now() - start);
         agentLog.info({ sessionId: this.sessionId, durationMs, done: !!resultState.finalReport }, 'SessionBridge invoke complete');

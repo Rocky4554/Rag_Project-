@@ -5,6 +5,9 @@ import { agentLog } from "../../lib/logger.js";
 
 dotenv.config();
 
+// Filler words to detect and count (used for behavioral context injection)
+const FILLER_WORD_REGEX = /\b(uh|um|er|erm|hmm|hm)\b/gi;
+
 export class DeepgramSTT extends EventEmitter {
     constructor() {
         super();
@@ -17,9 +20,17 @@ export class DeepgramSTT extends EventEmitter {
         this.model = process.env.DEEPGRAM_STT_MODEL || "nova-3";
         this.language = process.env.DEEPGRAM_STT_LANGUAGE || "en";
         this.smartFormat = (process.env.DEEPGRAM_STT_SMART_FORMAT || "true") === "true";
-        this.endpointing = parseInt(process.env.DEEPGRAM_STT_ENDPOINTING_MS || "300", 10);
+
+        // Improvement #2: 700ms endpointing gives candidates time to pause mid-thought
+        // without the agent cutting them off. 300ms was too aggressive for technical answers
+        // where candidates pause to recall terminology or construct complex sentences.
+        this.endpointing = parseInt(process.env.DEEPGRAM_STT_ENDPOINTING_MS || "700", 10);
 
         this.currentTranscript = "";
+
+        // Improvement #4: Acoustic metadata — per-utterance timing + filler tracking
+        this._utteranceStartMs = 0;   // timestamp of first final chunk for this utterance
+        this._fillerWordCount = 0;     // running count of uh/um/er in current utterance
     }
 
     start() {
@@ -40,13 +51,14 @@ export class DeepgramSTT extends EventEmitter {
             model: this.model,
             language: this.language,
             smart_format: String(this.smartFormat),
+            filler_words: "true",   // Improvement #2: keep uh/um/er in transcript for filler detection
             interim_results: "true",
             endpointing: String(this.endpointing),
         });
 
         const url = `wss://api.deepgram.com/v1/listen?${params.toString()}`;
 
-        agentLog.info({ model: this.model }, 'STT connecting to Deepgram');
+        agentLog.info({ model: this.model, endpointingMs: this.endpointing }, 'STT connecting to Deepgram');
         this._connectTs = Date.now();
 
         this.socket = new WebSocket(url, {
@@ -70,17 +82,43 @@ export class DeepgramSTT extends EventEmitter {
 
                     if (text) {
                         if (msg.is_final) {
+                            // Track utterance start on first final chunk
+                            if (!this._utteranceStartMs) {
+                                this._utteranceStartMs = Date.now();
+                            }
                             this.currentTranscript += text + " ";
+
+                            // Count filler words from each final chunk as they arrive
+                            const fillers = text.match(FILLER_WORD_REGEX);
+                            if (fillers) this._fillerWordCount += fillers.length;
                         }
                     }
 
                     if (msg.speech_final) {
                         const finalAnswer = this.currentTranscript.trim();
                         if (finalAnswer.length > 0) {
-                            agentLog.info({ transcript: finalAnswer.substring(0, 100), words: finalAnswer.trim().split(/\s+/).length }, 'STT speech final');
-                            this.emit("transcript", finalAnswer);
+                            const utteranceDurationMs = this._utteranceStartMs
+                                ? Date.now() - this._utteranceStartMs
+                                : 0;
+
+                            agentLog.info({
+                                transcript: finalAnswer.substring(0, 100),
+                                words: finalAnswer.trim().split(/\s+/).length,
+                                utteranceDurationMs,
+                                fillerWordCount: this._fillerWordCount,
+                            }, 'STT speech final');
+
+                            // Emit an object (not just a string) so worker gets acoustic metadata
+                            this.emit("transcript", {
+                                transcript: finalAnswer,
+                                utteranceDurationMs,
+                                fillerWordCount: this._fillerWordCount,
+                            });
                         }
-                        this.currentTranscript = ""; // reset for next utterance
+                        // Reset for next utterance
+                        this.currentTranscript = "";
+                        this._utteranceStartMs = 0;
+                        this._fillerWordCount = 0;
                     }
                 }
             } catch (err) {
@@ -131,8 +169,6 @@ export class DeepgramSTT extends EventEmitter {
      */
     pushAudio(int16Array) {
         if (this.isReady && this.socket && this.socket.readyState === WebSocket.OPEN) {
-            // Use byteOffset/byteLength to send only the viewed slice,
-            // not the entire underlying ArrayBuffer (which may be larger).
             const buf = Buffer.from(
                 int16Array.buffer,
                 int16Array.byteOffset,
