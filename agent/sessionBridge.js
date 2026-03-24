@@ -1,5 +1,6 @@
 import { interviewStateChannels } from "../lib/interview/interviewAgent.js";
 import { HumanMessage, AIMessage } from "@langchain/core/messages";
+import { agentLog } from "../lib/logger.js";
 
 /**
  * Acts as the bridge between the real-time LiveKit flow and your existing
@@ -23,10 +24,13 @@ export class SessionBridge {
             throw new Error("Session not found or interview not started.");
         }
 
-        console.log(`[SessionBridge] Processing transcript: "${transcript}"`);
-        
+        const start = performance.now();
+        agentLog.info({ sessionId: this.sessionId, transcriptLength: transcript.length }, 'SessionBridge processing transcript');
+
         const inputState = { userAnswer: transcript };
         const resultState = await this.agentWorkflow.invoke(inputState, session.interviewStateConfig);
+        const durationMs = Math.round(performance.now() - start);
+        agentLog.info({ sessionId: this.sessionId, durationMs, done: !!resultState.finalReport }, 'SessionBridge invoke complete');
 
         const isDone = !!resultState.finalReport;
         

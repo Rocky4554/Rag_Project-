@@ -3,6 +3,7 @@ import {
     SynthesizeSpeechCommand,
 } from "@aws-sdk/client-polly";
 import dotenv from "dotenv";
+import { ttsLog } from "../lib/logger.js";
 dotenv.config();
 
 const client = new PollyClient({
@@ -27,8 +28,9 @@ async function streamToBuffer(stream) {
 export async function generatePCM(text, sampleRate = "16000") {
     if (!text || !text.trim()) return null;
 
+    const start = performance.now();
     try {
-        console.log(`[Agent TTS] Requesting PCM audio for text: "${text.substring(0, 50)}..."`);
+        ttsLog.debug({ textLength: text.length, text: text.substring(0, 50) }, 'Agent TTS requesting PCM');
 
         const command = new SynthesizeSpeechCommand({
             Text: text,
@@ -49,14 +51,16 @@ export async function generatePCM(text, sampleRate = "16000") {
             buffer.length / Int16Array.BYTES_PER_ELEMENT
         );
 
-        console.log(`[Agent TTS] PCM Generated. Samples: ${int16Array.length}`);
+        const durationMs = Math.round(performance.now() - start);
+        ttsLog.debug({ samples: int16Array.length, durationMs }, 'Agent TTS PCM generated');
         return int16Array;
 
     } catch (err) {
-        console.error("[Agent TTS] Failed to generate PCM audio:", err.message);
-        console.error("[Agent TTS] Check: AWS_REGION=%s, POLLY_VOICE_ID=%s, POLLY_ENGINE=%s",
-            process.env.AWS_REGION, process.env.POLLY_VOICE_ID, process.env.POLLY_ENGINE);
-        console.error("[Agent TTS] Note: Neural voices may not be available in all AWS regions. Try AWS_REGION=us-east-1 or POLLY_ENGINE=standard");
+        const durationMs = Math.round(performance.now() - start);
+        ttsLog.error(
+            { durationMs, err: err.message, region: process.env.AWS_REGION, voice: process.env.POLLY_VOICE_ID, engine: process.env.POLLY_ENGINE },
+            'Agent TTS PCM generation failed'
+        );
         return null;
     }
 }
@@ -88,7 +92,7 @@ export async function* generatePCMPipelined(text, sampleRate = "16000") {
         return;
     }
 
-    console.log(`[Agent TTS] Pipelining ${sentences.length} sentences`);
+    ttsLog.debug({ sentences: sentences.length }, 'Agent TTS pipelining sentences');
 
     // Start ALL Polly requests concurrently
     const promises = sentences.map((sentence, i) =>

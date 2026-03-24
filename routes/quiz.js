@@ -4,12 +4,14 @@ import { optionalAuth } from "../middleware/auth.js";
 import { saveQuizResult, getDocumentBySessionId, logActivity } from "../lib/db.js";
 import { ensureSession } from "../lib/sessionRestore.js";
 import { validate, quizSchema } from '../lib/validation.js';
-import { chatLog as quizLog } from '../lib/logger.js';
+import { quizLog } from '../lib/logger.js';
 
 export function createQuizRoutes({ sessionCache }) {
     const router = Router();
 
     router.post('/quiz', validate(quizSchema), optionalAuth, async (req, res) => {
+        const routeStart = performance.now();
+
         try {
             const { sessionId, topic, numQuestions } = req.validated;
 
@@ -19,10 +21,14 @@ export function createQuizRoutes({ sessionCache }) {
                 return res.status(404).json({ error: 'Session not found or expired. Please upload the PDF again.' });
             }
 
+            quizLog.info({ sessionId, topic: topic || 'general', numQuestions: parseInt(numQuestions) || 5 }, 'Quiz request received');
+
+            const quizStart = performance.now();
             const quizData = await generateQuiz(session.vectorStore, {
                 topic: topic || "general",
                 numQuestions: parseInt(numQuestions) || 5
             });
+            const quizMs = Math.round(performance.now() - quizStart);
 
             // Persist quiz to Supabase if user is authenticated
             if (req.user) {
@@ -48,10 +54,17 @@ export function createQuizRoutes({ sessionCache }) {
                 }
             }
 
+            const totalMs = Math.round(performance.now() - routeStart);
+            quizLog.info(
+                { sessionId, totalMs, quizMs, questionsGenerated: quizData.quiz?.length || 0, topic: topic || 'general' },
+                'Quiz response sent'
+            );
+
             res.json(quizData);
 
         } catch (error) {
-            quizLog.error({ err: error.message }, 'Quiz generation error');
+            const totalMs = Math.round(performance.now() - routeStart);
+            quizLog.error({ err: error.message, totalMs }, 'Quiz generation error');
             res.status(500).json({ error: error.message || "Failed to generate quiz" });
         }
     });

@@ -1,6 +1,7 @@
 import WebSocket from "ws";
 import { EventEmitter } from "events";
 import dotenv from "dotenv";
+import { agentLog } from "../lib/logger.js";
 
 dotenv.config();
 
@@ -45,7 +46,7 @@ export class DeepgramSTT extends EventEmitter {
 
         const url = `wss://api.deepgram.com/v1/listen?${params.toString()}`;
 
-        console.log(`[STT] Connecting to Deepgram...`);
+        agentLog.info({ model: this.model }, 'STT connecting to Deepgram');
 
         this.socket = new WebSocket(url, {
             headers: {
@@ -54,7 +55,7 @@ export class DeepgramSTT extends EventEmitter {
         });
 
         this.socket.on("open", () => {
-            console.log("[STT] Deepgram WebSocket opened.");
+            agentLog.info('STT Deepgram WebSocket opened');
             this.isReady = true;
             this._startKeepalive();
         });
@@ -75,31 +76,31 @@ export class DeepgramSTT extends EventEmitter {
                     if (msg.speech_final) {
                         const finalAnswer = this.currentTranscript.trim();
                         if (finalAnswer.length > 0) {
-                            console.log(`[STT] Speech Final: "${finalAnswer}"`);
+                            agentLog.info({ transcript: finalAnswer.substring(0, 100) }, 'STT speech final');
                             this.emit("transcript", finalAnswer);
                         }
                         this.currentTranscript = ""; // reset for next utterance
                     }
                 }
             } catch (err) {
-                console.error("[STT] Parse error on incoming message:", err);
+                agentLog.error({ err: err.message }, 'STT parse error');
             }
         });
 
         this.socket.on("close", () => {
-            console.log("[STT] Deepgram WebSocket closed.");
+            agentLog.info('STT Deepgram WebSocket closed');
             this.isReady = false;
             this._stopKeepalive();
 
             // Auto-reconnect unless explicitly stopped
             if (!this._stopped) {
-                console.log("[STT] Reconnecting in 1s...");
+                agentLog.info('STT reconnecting in 1s');
                 setTimeout(() => this._connect(), 1000);
             }
         });
 
         this.socket.on("error", (err) => {
-            console.error("[STT] Deepgram WebSocket error:", err.message);
+            agentLog.error({ err: err.message }, 'STT Deepgram WebSocket error');
             this.isReady = false;
         });
     }

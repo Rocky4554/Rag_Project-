@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { queryRAG, queryRAGStream } from "../lib/pipeline/rag.js";
+import { routeQuery, routeQueryStream } from "../lib/pipeline/queryRouter.js";
 import { HumanMessage, AIMessage } from "@langchain/core/messages";
 import { optionalAuth } from "../middleware/auth.js";
 import { saveChatMessage, getChatHistory, getDocumentBySessionId } from "../lib/db.js";
@@ -11,6 +11,8 @@ export function createChatRoutes({ sessionCache }) {
     const router = Router();
 
     router.post('/chat', validate(chatSchema), optionalAuth, async (req, res) => {
+        const routeStart = performance.now();
+
         try {
             const { sessionId, question } = req.validated;
 
@@ -20,7 +22,7 @@ export function createChatRoutes({ sessionCache }) {
                 return res.status(404).json({ error: 'Session not found or expired. Please upload the PDF again.' });
             }
 
-            chatLog.info({ sessionId, question: question.substring(0, 80) }, 'Chat request');
+            chatLog.info({ sessionId, question: question.substring(0, 80), historySize: session.chatHistory.length }, 'Chat request received');
 
             // If user is authenticated and session chatHistory is empty, restore from DB
             if (req.user && session.chatHistory.length === 0) {
@@ -32,13 +34,16 @@ export function createChatRoutes({ sessionCache }) {
                             m.role === 'user' ? new HumanMessage(m.content) : new AIMessage(m.content)
                         );
                         session._documentId = doc.id;
+                        chatLog.info({ sessionId, restoredMessages: dbHistory.length }, 'Chat history restored from DB');
                     }
                 } catch (err) {
                     chatLog.warn({ err: err.message }, 'Failed to restore chat history');
                 }
             }
 
-            const answer = await queryRAG(session.vectorStore, question, session.chatHistory);
+            const ragStart = performance.now();
+            const { route, answer } = await routeQuery(session, question, session.chatHistory, req.user?.name);
+            const ragMs = Math.round(performance.now() - ragStart);
 
             session.chatHistory.push(new HumanMessage(question));
             session.chatHistory.push(new AIMessage(answer));
@@ -53,16 +58,25 @@ export function createChatRoutes({ sessionCache }) {
                 saveChatMessage({ userId: req.user.id, documentId: session._documentId, role: 'ai', content: answer });
             }
 
-            res.json({ answer });
+            const totalMs = Math.round(performance.now() - routeStart);
+            chatLog.info(
+                { sessionId, totalMs, ragMs, route, answerLength: answer.length, question: question.substring(0, 60) },
+                'Chat response sent'
+            );
+
+            res.json({ answer, route });
 
         } catch (error) {
-            chatLog.error({ err: error.message }, 'Chat error');
+            const totalMs = Math.round(performance.now() - routeStart);
+            chatLog.error({ err: error.message, totalMs }, 'Chat error');
             res.status(500).json({ error: error.message || "Failed to get answer" });
         }
     });
 
     // ── Streaming chat endpoint (SSE) ──────────────────────────────
     router.post('/chat/stream', validate(chatSchema), optionalAuth, async (req, res) => {
+        const routeStart = performance.now();
+
         try {
             const { sessionId, question } = req.validated;
 
@@ -71,7 +85,7 @@ export function createChatRoutes({ sessionCache }) {
                 return res.status(404).json({ error: 'Session not found or expired. Please upload the PDF again.' });
             }
 
-            chatLog.info({ sessionId, question: question.substring(0, 80) }, 'Chat stream request');
+            chatLog.info({ sessionId, question: question.substring(0, 80), streaming: true }, 'Chat stream request received');
 
             // Restore chat history from DB if needed
             if (req.user && session.chatHistory.length === 0) {
@@ -89,17 +103,23 @@ export function createChatRoutes({ sessionCache }) {
                 }
             }
 
-            // SSE headers
+            // SSE headers — disable any proxy/middleware buffering
             res.setHeader('Content-Type', 'text/event-stream');
-            res.setHeader('Cache-Control', 'no-cache');
+            res.setHeader('Cache-Control', 'no-cache, no-transform');
             res.setHeader('Connection', 'keep-alive');
+            res.setHeader('X-Accel-Buffering', 'no');
+            res.setHeader('Content-Encoding', 'none');
             res.flushHeaders();
 
             let fullAnswer = '';
+            let tokenCount = 0;
 
-            for await (const token of queryRAGStream(session.vectorStore, question, session.chatHistory)) {
+            for await (const token of routeQueryStream(session, question, session.chatHistory, req.user?.name)) {
                 fullAnswer += token;
+                tokenCount++;
                 res.write(`data: ${JSON.stringify({ token })}\n\n`);
+                // Flush each token immediately for real-time streaming
+                if (typeof res.flush === 'function') res.flush();
             }
 
             res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
@@ -118,8 +138,15 @@ export function createChatRoutes({ sessionCache }) {
                 saveChatMessage({ userId: req.user.id, documentId: session._documentId, role: 'ai', content: fullAnswer });
             }
 
+            const totalMs = Math.round(performance.now() - routeStart);
+            chatLog.info(
+                { sessionId, totalMs, tokenChunks: tokenCount, answerLength: fullAnswer.length, question: question.substring(0, 60) },
+                'Chat stream complete'
+            );
+
         } catch (error) {
-            chatLog.error({ err: error.message }, 'Chat stream error');
+            const totalMs = Math.round(performance.now() - routeStart);
+            chatLog.error({ err: error.message, totalMs }, 'Chat stream error');
             if (!res.headersSent) {
                 res.status(500).json({ error: error.message || "Failed to get answer" });
             } else {

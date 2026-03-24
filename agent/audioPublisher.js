@@ -1,4 +1,5 @@
 import { AudioSource, AudioFrame } from "@livekit/rtc-node";
+import { agentLog } from "../lib/logger.js";
 
 // LiveKit requires PCM audio pushed as AudioFrame objects in 10ms chunks
 export class AudioPublisher {
@@ -19,14 +20,14 @@ export class AudioPublisher {
     async pushPCM(pcmData) {
         this.isSpeaking = true;
         this.stopFlag = false;
-        console.log(`[AudioPublisher] Starting playback of ${pcmData.length} samples at ${this.sampleRate}Hz`);
+        agentLog.debug({ samples: pcmData.length, sampleRate: this.sampleRate }, 'AudioPublisher starting playback');
 
         const startTime = performance.now();
         let chunksSent = 0;
 
         for (let offset = 0; offset < pcmData.length; offset += this.samplesPerChunk) {
             if (this.stopFlag) {
-                console.log("[AudioPublisher] Playback interrupted.");
+                agentLog.debug('AudioPublisher playback interrupted');
                 break;
             }
 
@@ -63,7 +64,8 @@ export class AudioPublisher {
             }
         }
 
-        console.log("[AudioPublisher] Playback complete.");
+        const playbackMs = Math.round(performance.now() - startTime);
+        agentLog.debug({ chunksSent, playbackMs }, 'AudioPublisher playback complete');
         this.isSpeaking = false;
     }
 

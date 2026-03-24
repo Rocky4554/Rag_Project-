@@ -7,6 +7,7 @@ import { AudioPublisher } from "./audioPublisher.js";
 import { generatePCM, generatePCMPipelined } from "./tts.js";
 import { SessionBridge } from "./sessionBridge.js";
 import { parseTTSResponse } from "../lib/interview/interviewAgent.js";
+import { agentLog } from "../lib/logger.js";
 
 // Spoken text for cached TTS phrase keys.
 // The LLM emits tags like [great_answer] which parseTTSResponse strips out.
@@ -89,7 +90,7 @@ export class InterviewAgentWorker {
     }
 
     async start() {
-        console.log(`[AgentWorker] Starting for session: ${this.sessionId}`);
+        agentLog.info({ sessionId: this.sessionId }, 'AgentWorker starting');
 
         // 1. Start STT connection early (non-blocking WebSocket handshake)
         this.stt.start();
@@ -100,7 +101,7 @@ export class InterviewAgentWorker {
 
         // 3. Connect to LiveKit Room
         await this.room.connect(process.env.LIVEKIT_URL, token);
-        console.log(`[AgentWorker] Connected to room: ${this.sessionId}`);
+        agentLog.info({ sessionId: this.sessionId }, 'AgentWorker connected to room');
 
         // 4. Publish AI voice track
         const track = LocalAudioTrack.createAudioTrack("ai-interviewer-audio", this.audioPublisher.source);
@@ -108,7 +109,7 @@ export class InterviewAgentWorker {
             name: "ai-interviewer-audio",
             source: TrackSource.SOURCE_MICROPHONE // properly imported enum
         });
-        console.log(`[AgentWorker] Published AI audio track`);
+        agentLog.info({ sessionId: this.sessionId }, 'AI audio track published');
 
         this.isActive = true;
     }
@@ -129,25 +130,25 @@ export class InterviewAgentWorker {
 
     setupRoomEvents() {
         this.room.on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
-            console.log(`[AgentWorker] TrackSubscribed: kind=${track.kind}, from=${participant.identity}`);
+            agentLog.debug({ kind: track.kind, from: participant.identity }, 'Track subscribed');
             if (track.kind === TrackKind.KIND_AUDIO) {
-                console.log(`[AgentWorker] Subscribed to audio from: ${participant.identity}`);
+                agentLog.info({ sessionId: this.sessionId, participant: participant.identity }, 'Subscribed to user audio');
                 this.listenToUserAudio(track);
             }
         });
 
         this.room.on(RoomEvent.Disconnected, () => {
-            console.log(`[AgentWorker] Disconnected from room.`);
+            agentLog.info({ sessionId: this.sessionId }, 'Disconnected from room');
             this.stop();
         });
 
         // Handle full transcript from STT
         this.stt.on("transcript", async (text) => {
             if (!this.isActive || this.processingTurn) return;
-            
+
             // Basic VAD: don't process if the AI is currently speaking
             if (this.audioPublisher.isSpeaking) {
-                console.log(`[AgentWorker] Ignored transcript (AI is speaking)`);
+                agentLog.debug({ sessionId: this.sessionId }, 'Ignored transcript (AI is speaking)');
                 return;
             }
 
@@ -170,16 +171,17 @@ export class InterviewAgentWorker {
                         }
                     }
                 }
-                console.log("[AgentWorker] User audio stream ended.");
+                agentLog.debug({ sessionId: this.sessionId }, 'User audio stream ended');
             } catch (err) {
-                console.error("[AgentWorker] User audio stream error:", err.message);
+                agentLog.error({ sessionId: this.sessionId, err: err.message }, 'User audio stream error');
             }
         })();
     }
 
     async handleUserTurn(transcript) {
+        const turnStart = performance.now();
         this.processingTurn = true;
-        
+
         // Notify UI that we heard something
         if (this.io) {
             this.io.to(this.sessionId).emit('ai_state', { state: 'thinking', text: 'Evaluating your answer...' });
@@ -189,7 +191,9 @@ export class InterviewAgentWorker {
         try {
             // 1. Process via LangGraph
             const result = await this.sessionBridge.processUserTranscript(transcript);
-            
+            const processMs = Math.round(performance.now() - turnStart);
+            agentLog.info({ sessionId: this.sessionId, processMs, done: result.done }, 'User turn processed');
+
             // 2. Notify UI of feedback/score
             if (this.io && result.evaluation) {
                 this.io.to(this.sessionId).emit('ai_feedback', {
@@ -211,7 +215,7 @@ export class InterviewAgentWorker {
                     try {
                         await session._onInterviewComplete(result);
                     } catch (err) {
-                        console.error(`[AgentWorker] Failed to save interview result:`, err.message);
+                        agentLog.error({ sessionId: this.sessionId, err: err.message }, 'Failed to save interview result');
                     }
                 }
 
@@ -264,8 +268,11 @@ export class InterviewAgentWorker {
                 }
             }
 
+            const totalMs = Math.round(performance.now() - turnStart);
+            agentLog.info({ sessionId: this.sessionId, totalMs }, 'Turn complete');
+
         } catch (err) {
-            console.error(`[AgentWorker] Turn error:`, err);
+            agentLog.error({ sessionId: this.sessionId, err: err.message }, 'Turn error');
         } finally {
             this.processingTurn = false;
         }
@@ -293,21 +300,21 @@ export class InterviewAgentWorker {
             const fullText = `${phrases} ${parsed.uniquePart}`.replace(/\s+/g, " ").trim();
 
             if (fullText) {
-                console.log(`[AgentWorker] Speaking (pipelined): "${fullText.substring(0, 80)}..."`);
+                agentLog.info({ sessionId: this.sessionId, text: fullText.substring(0, 80) }, 'Speaking (pipelined)');
                 // Stream sentence-by-sentence: play first sentence ASAP while rest generates
                 for await (const { pcm } of generatePCMPipelined(fullText, "16000")) {
                     await this._playAudio(pcm);
                 }
             }
         } catch (err) {
-            console.error(`[AgentWorker] speak() error:`, err);
+            agentLog.error({ sessionId: this.sessionId, err: err.message }, 'speak() error');
         } finally {
             this.processingTurn = false;
         }
     }
 
     stop() {
-        console.log(`[AgentWorker] Stopping session: ${this.sessionId}`);
+        agentLog.info({ sessionId: this.sessionId }, 'AgentWorker stopping');
         this.isActive = false;
         this.stt.stop();
         this.audioPublisher.stop();

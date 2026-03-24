@@ -39,6 +39,9 @@ export function createInterviewRoutes({ sessionCache, activeAgents, clientReadyR
                 }
             }
 
+            const h = new Date().getHours();
+            const timeGreeting = h < 12 ? 'Good morning' : h < 17 ? 'Good afternoon' : 'Good evening';
+
             const initialState = {
                 sessionId,
                 maxQuestions: parseInt(maxQuestions),
@@ -46,7 +49,9 @@ export function createInterviewRoutes({ sessionCache, activeAgents, clientReadyR
                 chatHistory: [],
                 questionsAsked: 0,
                 topicsUsed: [],
-                userProfileContext
+                userProfileContext,
+                candidateName: req.user?.name || "there",
+                timeGreeting,
             };
 
             // thread_id for LangSmith tracing + PostgresSaver checkpointing

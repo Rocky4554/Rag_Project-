@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { requireAuth } from '../middleware/auth.js';
 import { getUserDocuments, getInterviewResults, getQuizResults, getRecentActivity } from '../lib/db.js';
+import { serverLog } from '../lib/logger.js';
 
 export function createHistoryRoutes() {
     const router = Router();
@@ -11,7 +12,7 @@ export function createHistoryRoutes() {
             const documents = await getUserDocuments(req.user.id);
             res.json({ documents });
         } catch (error) {
-            console.error('[History] Documents error:', error);
+            serverLog.error({ err: error.message }, 'History documents error');
             res.status(500).json({ error: 'Failed to load documents' });
         }
     });
@@ -22,7 +23,7 @@ export function createHistoryRoutes() {
             const results = await getInterviewResults(req.user.id, req.query.documentId);
             res.json({ results });
         } catch (error) {
-            console.error('[History] Interview results error:', error);
+            serverLog.error({ err: error.message }, 'History interview results error');
             res.status(500).json({ error: 'Failed to load interview results' });
         }
     });
@@ -33,7 +34,7 @@ export function createHistoryRoutes() {
             const results = await getQuizResults(req.user.id, req.query.documentId);
             res.json({ results });
         } catch (error) {
-            console.error('[History] Quiz results error:', error);
+            serverLog.error({ err: error.message }, 'History quiz results error');
             res.status(500).json({ error: 'Failed to load quiz results' });
         }
     });
@@ -45,7 +46,7 @@ export function createHistoryRoutes() {
             const activity = await getRecentActivity(req.user.id, limit);
             res.json({ activity });
         } catch (error) {
-            console.error('[History] Activity error:', error);
+            serverLog.error({ err: error.message }, 'History activity error');
             res.status(500).json({ error: 'Failed to load activity' });
         }
     });

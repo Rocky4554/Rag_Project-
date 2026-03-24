@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { AccessToken } from 'livekit-server-sdk';
+import { serverLog } from '../lib/logger.js';
 
 export function createTokenRoutes() {
     const router = Router();
@@ -31,12 +32,12 @@ export function createTokenRoutes() {
             });
 
             const token = await at.toJwt();
-            console.log(`[LiveKit] Token generated for session: ${sessionId}`);
+            serverLog.info({ sessionId }, 'LiveKit token generated');
 
             res.json({ token, url: livekitUrl });
 
         } catch (error) {
-            console.error('[LiveKit] Token generation error:', error);
+            serverLog.error({ err: error.message }, 'LiveKit token generation error');
             res.status(500).json({ error: error.message || 'Failed to generate LiveKit token' });
         }
     });
@@ -69,7 +70,7 @@ export function createTokenRoutes() {
                 }
             });
         } catch (error) {
-            console.error('[Deepgram] Token generation error:', error);
+            serverLog.error({ err: error.message }, 'Deepgram token generation error');
             res.status(500).json({ error: 'Failed to retrieve Deepgram token' });
         }
     });

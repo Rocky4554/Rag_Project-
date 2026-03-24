@@ -5,12 +5,14 @@ import { optionalAuth } from "../middleware/auth.js";
 import { logActivity } from "../lib/db.js";
 import { ensureSession } from "../lib/sessionRestore.js";
 import { validate, summarySchema } from '../lib/validation.js';
-import { chatLog as summaryLog } from '../lib/logger.js';
+import { summaryLog } from '../lib/logger.js';
 
 export function createSummaryRoutes({ sessionCache }) {
     const router = Router();
 
     router.post('/summary', validate(summarySchema), optionalAuth, async (req, res) => {
+        const routeStart = performance.now();
+
         try {
             const { sessionId } = req.validated;
 
@@ -20,7 +22,7 @@ export function createSummaryRoutes({ sessionCache }) {
                 return res.status(404).json({ error: 'Session not found or expired. Please upload the PDF again.' });
             }
 
-            summaryLog.info({ sessionId }, 'Generating summary');
+            summaryLog.info({ sessionId }, 'Summary request received');
 
             // Use original docs if available, otherwise retrieve from vector store
             let docs = session.docs;
@@ -34,10 +36,15 @@ export function createSummaryRoutes({ sessionCache }) {
                 }
             }
 
+            const llmStart = performance.now();
             const summary = await summarizeDocs(docs);
+            const llmMs = Math.round(performance.now() - llmStart);
+            summaryLog.info({ sessionId, llmMs, summaryLength: summary.length }, 'Summary text generated');
 
-            summaryLog.info({ sessionId }, 'Converting summary to audio');
+            const ttsStart = performance.now();
             const audio = await textToAudio(summary);
+            const ttsMs = Math.round(performance.now() - ttsStart);
+            summaryLog.info({ sessionId, ttsMs, audioSize: audio?.length || 0 }, 'Summary audio generated');
 
             // Log activity if user is authenticated
             if (req.user) {
@@ -48,10 +55,17 @@ export function createSummaryRoutes({ sessionCache }) {
                 });
             }
 
+            const totalMs = Math.round(performance.now() - routeStart);
+            summaryLog.info(
+                { sessionId, totalMs, llmMs, ttsMs, summaryWords: summary.split(/\s+/).length },
+                'Summary response sent'
+            );
+
             res.json({ summary, audio });
 
         } catch (error) {
-            summaryLog.error({ err: error.message }, 'Summary/TTS error');
+            const totalMs = Math.round(performance.now() - routeStart);
+            summaryLog.error({ err: error.message, totalMs }, 'Summary/TTS error');
             res.status(500).json({ error: error.message || "Failed to generate summary or audio" });
         }
     });
