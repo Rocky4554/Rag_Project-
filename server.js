@@ -5,7 +5,6 @@ import cookieParser from 'cookie-parser';
 import rateLimit from 'express-rate-limit';
 import multer from 'multer';
 import path from 'path';
-import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { createServer } from 'http';
 import { Server as SocketIOServer } from 'socket.io';
@@ -22,6 +21,7 @@ import { createInterviewRoutes } from './routes/interview.js';
 import { createAuthRoutes } from './routes/auth.js';
 import { createHistoryRoutes } from './routes/history.js';
 import { createSessionRoutes } from './routes/session.js';
+import { createVoiceAgentRoutes } from './routes/voiceAgent.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -46,6 +46,7 @@ const io = new SocketIOServer(httpServer, {
 // ── Shared state ─────────────────────────────────────────────────
 const sessionCache = {};
 const activeAgents = new Map();
+const activeVoiceAgents = new Map();
 const clientReadyResolvers = new Map();
 
 // ── Session TTL cleanup (prevents memory leak) ──────────────────
@@ -56,10 +57,14 @@ setInterval(() => {
     let cleaned = 0;
     for (const [id, session] of Object.entries(sessionCache)) {
         if (now - (session.createdAt || 0) > SESSION_TTL) {
-            // Stop active agent if running
+            // Stop active agents if running
             if (activeAgents.has(id)) {
                 activeAgents.get(id).stop();
                 activeAgents.delete(id);
+            }
+            if (activeVoiceAgents.has(id)) {
+                activeVoiceAgents.get(id).stop();
+                activeVoiceAgents.delete(id);
             }
             delete sessionCache[id];
             cleaned++;
@@ -140,22 +145,9 @@ const uploadLimiter = rateLimit({
     message: { error: 'Too many uploads, please try again later' }
 });
 
-// ── Multer ───────────────────────────────────────────────────────
-const uploadDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadDir)) {
-    fs.mkdirSync(uploadDir);
-}
-
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, 'uploads/'),
-    filename: (req, file, cb) => {
-        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-        cb(null, uniqueSuffix + path.extname(file.originalname));
-    }
-});
-
+// ── Multer (memory storage — no files written to disk) ──────────
 const upload = multer({
-    storage,
+    storage: multer.memoryStorage(),
     limits: { fileSize: 20 * 1024 * 1024 }, // 20MB max
     fileFilter: (req, file, cb) => {
         if (file.mimetype === 'application/pdf') cb(null, true);
@@ -186,7 +178,7 @@ async function startServer() {
     }
 
     // ── Routes with rate limiters ────────────────────────────────
-    const deps = { sessionCache, activeAgents, clientReadyResolvers, io, upload, interviewAgent };
+    const deps = { sessionCache, activeAgents, activeVoiceAgents, clientReadyResolvers, io, upload, interviewAgent };
 
     app.use('/api/auth', authLimiter);
     app.use('/api', createAuthRoutes());
@@ -205,6 +197,9 @@ async function startServer() {
 
     app.use('/api/interview', llmLimiter);
     app.use('/api', createInterviewRoutes(deps));
+
+    app.use('/api/voice-agent', llmLimiter);
+    app.use('/api', createVoiceAgentRoutes(deps));
 
     app.use('/api', apiLimiter);
     app.use('/api', createTokenRoutes());

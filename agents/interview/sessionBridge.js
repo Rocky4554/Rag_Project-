@@ -1,6 +1,6 @@
-import { interviewStateChannels } from "../lib/interview/interviewAgent.js";
+import { interviewStateChannels } from "../../lib/interview/interviewAgent.js";
 import { HumanMessage, AIMessage } from "@langchain/core/messages";
-import { agentLog } from "../lib/logger.js";
+import { agentLog } from "../../lib/logger.js";
 
 /**
  * Acts as the bridge between the real-time LiveKit flow and your existing
@@ -36,6 +36,7 @@ export class SessionBridge {
         
         return {
             done: isDone,
+            intent: resultState.intent,
             evaluation: resultState.evaluation,
             nextQuestion: isDone ? null : resultState.currentQuestion,
             finalReport: resultState.finalReport,

@@ -3,11 +3,11 @@ import { AccessToken } from "livekit-server-sdk";
 import dotenv from "dotenv";
 
 import { DeepgramSTT } from "./stt.js";
-import { AudioPublisher } from "./audioPublisher.js";
+import { AudioPublisher } from "../shared/audioPublisher.js";
 import { generatePCM, generatePCMPipelined } from "./tts.js";
 import { SessionBridge } from "./sessionBridge.js";
-import { parseTTSResponse } from "../lib/interview/interviewAgent.js";
-import { agentLog } from "../lib/logger.js";
+import { parseTTSResponse } from "../../lib/interview/interviewAgent.js";
+import { agentLog } from "../../lib/logger.js";
 
 // Spoken text for cached TTS phrase keys.
 // The LLM emits tags like [great_answer] which parseTTSResponse strips out.
@@ -90,26 +90,36 @@ export class InterviewAgentWorker {
     }
 
     async start() {
+        const startTs = performance.now();
         agentLog.info({ sessionId: this.sessionId }, 'AgentWorker starting');
 
-        // 1. Start STT connection early (non-blocking WebSocket handshake)
+        // 1. Start Deepgram STT (non-blocking — WebSocket handshake runs in background)
+        const sttModel = process.env.DEEPGRAM_STT_MODEL || 'nova-3';
+        agentLog.info({ sessionId: this.sessionId, model: sttModel }, '[1/4] Starting Deepgram STT...');
         this.stt.start();
 
-        // 2. Generate token + setup room events in parallel
+        // 2. Generate LiveKit token
+        const tokenTs = performance.now();
+        agentLog.info({ sessionId: this.sessionId }, '[2/4] Generating LiveKit token...');
         const token = await this.generateToken();
+        agentLog.info({ sessionId: this.sessionId, ms: Math.round(performance.now() - tokenTs) }, '[2/4] LiveKit token ready');
         this.setupRoomEvents();
 
         // 3. Connect to LiveKit Room
+        const connectTs = performance.now();
+        agentLog.info({ sessionId: this.sessionId }, '[3/4] Connecting to LiveKit room...');
         await this.room.connect(process.env.LIVEKIT_URL, token);
-        agentLog.info({ sessionId: this.sessionId }, 'AgentWorker connected to room');
+        agentLog.info({ sessionId: this.sessionId, ms: Math.round(performance.now() - connectTs) }, '[3/4] LiveKit room connected');
 
         // 4. Publish AI voice track
+        const trackTs = performance.now();
+        agentLog.info({ sessionId: this.sessionId }, '[4/4] Publishing AI audio track...');
         const track = LocalAudioTrack.createAudioTrack("ai-interviewer-audio", this.audioPublisher.source);
         await this.room.localParticipant.publishTrack(track, {
             name: "ai-interviewer-audio",
-            source: TrackSource.SOURCE_MICROPHONE // properly imported enum
+            source: TrackSource.SOURCE_MICROPHONE
         });
-        agentLog.info({ sessionId: this.sessionId }, 'AI audio track published');
+        agentLog.info({ sessionId: this.sessionId, ms: Math.round(performance.now() - trackTs), totalMs: Math.round(performance.now() - startTs) }, '[4/4] AgentWorker ready');
 
         this.isActive = true;
     }
@@ -182,6 +192,8 @@ export class InterviewAgentWorker {
         const turnStart = performance.now();
         this.processingTurn = true;
 
+        agentLog.info({ sessionId: this.sessionId, transcript: transcript.substring(0, 150), words: transcript.trim().split(/\s+/).length }, '🎤 User said');
+
         // Notify UI that we heard something
         if (this.io) {
             this.io.to(this.sessionId).emit('ai_state', { state: 'thinking', text: 'Evaluating your answer...' });
@@ -194,6 +206,19 @@ export class InterviewAgentWorker {
             const processMs = Math.round(performance.now() - turnStart);
             agentLog.info({ sessionId: this.sessionId, processMs, done: result.done }, 'User turn processed');
 
+            if (!result.done && result.evaluation) {
+                agentLog.info({
+                    sessionId: this.sessionId,
+                    intent: result.intent,
+                    quality: result.answerQuality,
+                    score: result.evaluation?.score,
+                    topic: result.topicTag,
+                    difficulty: result.difficultyLevel,
+                    nextDifficulty: result.evaluation?.nextDifficulty,
+                    questionNum: result.questionsAsked,
+                }, 'LangGraph turn result');
+            }
+
             // 2. Notify UI of feedback/score
             if (this.io && result.evaluation) {
                 this.io.to(this.sessionId).emit('ai_feedback', {
@@ -203,10 +228,18 @@ export class InterviewAgentWorker {
                 });
             }
 
+            // Intents fully handled inside handleEdgeCaseNode — speak feedback only, no next question
+            const FEEDBACK_ONLY_INTENTS = ['confused', 'meta', 'irrelevant'];
+
             if (result.done) {
                 // Interview over
                 if (this.io) {
-                    this.io.to(this.sessionId).emit('interview_done', { report: result.finalReport });
+                    this.io.to(this.sessionId).emit('interview_done', {
+                        report: result.finalReport,
+                        topicScores: result.topicScores || {},
+                        scores: result.scores || [],
+                        questionsAsked: result.questionsAsked || 0
+                    });
                 }
 
                 // Save interview results to DB via the callback set in routes/interview.js
@@ -224,6 +257,21 @@ export class InterviewAgentWorker {
                 }
 
                 setTimeout(() => this.stop(), 2000);
+            } else if (FEEDBACK_ONLY_INTENTS.includes(result.intent)) {
+                // confused / meta / irrelevant — speak only the feedback response, no new question
+                const feedbackText = result.evaluation?.feedback || "";
+                if (this.io) {
+                    this.io.to(this.sessionId).emit('transcript_final', { role: 'ai', text: feedbackText });
+                    this.io.to(this.sessionId).emit('ai_state', { state: 'speaking', text: 'AI Speaking...' });
+                }
+                if (feedbackText) {
+                    for await (const { pcm } of generatePCMPipelined(feedbackText, "16000")) {
+                        await this._playAudio(pcm);
+                    }
+                }
+                if (this.io) {
+                    this.io.to(this.sessionId).emit('ai_state', { state: 'listening', text: 'Your turn to speak...' });
+                }
             } else {
                 // Next question
                 if (this.io) {
@@ -238,12 +286,21 @@ export class InterviewAgentWorker {
                 const feedbackPhrases = (parsedFeedback.phraseKeys || []).map(k => PHRASE_TEXT[k] || "").join(" ");
                 const questionPhrases = (parsedQuestion.phraseKeys || []).map(k => PHRASE_TEXT[k] || "").join(" ");
 
+                // Log phrase cache hits
+                for (const k of (parsedFeedback.phraseKeys || [])) {
+                    if (PHRASE_TEXT[k]) agentLog.info({ sessionId: this.sessionId, tag: k, phrase: PHRASE_TEXT[k] }, 'TTS phrase cache hit');
+                }
+                for (const k of (parsedQuestion.phraseKeys || [])) {
+                    if (PHRASE_TEXT[k]) agentLog.info({ sessionId: this.sessionId, tag: k, phrase: PHRASE_TEXT[k] }, 'TTS phrase cache hit');
+                }
+
                 // Build two parts: short feedback phrase + longer question text
                 const feedbackText = `${feedbackPhrases} ${parsedFeedback.uniquePart}`.trim();
                 const questionText = `${questionPhrases} ${parsedQuestion.uniquePart}`.trim();
 
                 // Play feedback phrase first (short, fast TTS) while question TTS generates
                 if (feedbackText && questionText) {
+                    agentLog.info({ sessionId: this.sessionId, feedback: feedbackText.substring(0, 80), question: questionText.substring(0, 80) }, 'TTS parallel (feedback + question)');
                     // Start question TTS generation in background while we play feedback
                     const questionTTSPromise = generatePCM(questionText, "16000");
 
@@ -257,6 +314,7 @@ export class InterviewAgentWorker {
                 } else {
                     const spokenText = `${feedbackText} ${questionText}`.trim();
                     if (spokenText) {
+                        agentLog.info({ sessionId: this.sessionId, text: spokenText.substring(0, 80) }, 'TTS pipelined generation');
                         for await (const { pcm } of generatePCMPipelined(spokenText, "16000")) {
                             await this._playAudio(pcm);
                         }

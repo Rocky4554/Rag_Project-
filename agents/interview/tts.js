@@ -3,7 +3,7 @@ import {
     SynthesizeSpeechCommand,
 } from "@aws-sdk/client-polly";
 import dotenv from "dotenv";
-import { ttsLog } from "../lib/logger.js";
+import { ttsLog } from "../../lib/logger.js";
 dotenv.config();
 
 const client = new PollyClient({
@@ -29,15 +29,18 @@ export async function generatePCM(text, sampleRate = "16000") {
     if (!text || !text.trim()) return null;
 
     const start = performance.now();
+    const voiceId = process.env.POLLY_VOICE_ID || 'Joanna';
+    const engine = process.env.POLLY_ENGINE || 'neural';
+    const region = process.env.AWS_REGION || 'us-east-1';
     try {
-        ttsLog.debug({ textLength: text.length, text: text.substring(0, 50) }, 'Agent TTS requesting PCM');
+        ttsLog.info({ textLength: text.length, text: text.substring(0, 50), voice: voiceId, engine, region }, 'TTS Polly request');
 
         const command = new SynthesizeSpeechCommand({
             Text: text,
-            OutputFormat: "pcm", // CRITICAL: LiveKit needs uncompressed PCM, not MP3
-            SampleRate: sampleRate, // "16000" or "48000" (LiveKit defaults to 48k but handles 16k well)
-            VoiceId: process.env.POLLY_VOICE_ID || "Joanna",
-            Engine: process.env.POLLY_ENGINE || "neural",
+            OutputFormat: "pcm",
+            SampleRate: sampleRate,
+            VoiceId: voiceId,
+            Engine: engine,
         });
 
         const response = await client.send(command);
@@ -52,7 +55,7 @@ export async function generatePCM(text, sampleRate = "16000") {
         );
 
         const durationMs = Math.round(performance.now() - start);
-        ttsLog.debug({ samples: int16Array.length, durationMs }, 'Agent TTS PCM generated');
+        ttsLog.info({ samples: int16Array.length, durationMs, voice: voiceId, engine }, 'TTS Polly ready');
         return int16Array;
 
     } catch (err) {
@@ -92,12 +95,18 @@ export async function* generatePCMPipelined(text, sampleRate = "16000") {
         return;
     }
 
-    ttsLog.debug({ sentences: sentences.length }, 'Agent TTS pipelining sentences');
+    ttsLog.info({ sentences: sentences.length, totalChars: text.length }, 'TTS pipeline start');
 
     // Start ALL Polly requests concurrently
-    const promises = sentences.map((sentence, i) =>
-        generatePCM(sentence, sampleRate).then(pcm => ({ pcm, index: i }))
-    );
+    const sentenceStartTs = performance.now();
+    const promises = sentences.map((sentence, i) => {
+        const sentTs = performance.now();
+        ttsLog.info({ idx: i, sentence: sentence.substring(0, 60) }, 'TTS sentence dispatched');
+        return generatePCM(sentence, sampleRate).then(pcm => {
+            ttsLog.info({ idx: i, durationMs: Math.round(performance.now() - sentTs), voice: process.env.POLLY_VOICE_ID || 'Joanna' }, 'TTS sentence ready');
+            return { pcm, index: i };
+        });
+    });
 
     // Yield in order as they complete, but prioritize sequential order
     // so audio plays in the right sequence

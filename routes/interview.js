@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { registerVectorStore, parseTTSResponse } from "../lib/interview/interviewAgent.js";
-import { InterviewAgentWorker } from "../agent/agent.js";
+import { InterviewAgentWorker } from "../agents/interview/worker.js";
 import { optionalAuth } from "../middleware/auth.js";
 import { getDocumentBySessionId, saveInterviewResult, logActivity } from "../lib/db.js";
 import { ensureSession } from "../lib/sessionRestore.js";

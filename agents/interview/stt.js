@@ -1,7 +1,7 @@
 import WebSocket from "ws";
 import { EventEmitter } from "events";
 import dotenv from "dotenv";
-import { agentLog } from "../lib/logger.js";
+import { agentLog } from "../../lib/logger.js";
 
 dotenv.config();
 
@@ -47,6 +47,7 @@ export class DeepgramSTT extends EventEmitter {
         const url = `wss://api.deepgram.com/v1/listen?${params.toString()}`;
 
         agentLog.info({ model: this.model }, 'STT connecting to Deepgram');
+        this._connectTs = Date.now();
 
         this.socket = new WebSocket(url, {
             headers: {
@@ -55,7 +56,7 @@ export class DeepgramSTT extends EventEmitter {
         });
 
         this.socket.on("open", () => {
-            agentLog.info('STT Deepgram WebSocket opened');
+            agentLog.info({ ms: Math.round(Date.now() - (this._connectTs || Date.now())), model: this.model }, 'STT Deepgram WebSocket opened');
             this.isReady = true;
             this._startKeepalive();
         });
@@ -76,7 +77,7 @@ export class DeepgramSTT extends EventEmitter {
                     if (msg.speech_final) {
                         const finalAnswer = this.currentTranscript.trim();
                         if (finalAnswer.length > 0) {
-                            agentLog.info({ transcript: finalAnswer.substring(0, 100) }, 'STT speech final');
+                            agentLog.info({ transcript: finalAnswer.substring(0, 100), words: finalAnswer.trim().split(/\s+/).length }, 'STT speech final');
                             this.emit("transcript", finalAnswer);
                         }
                         this.currentTranscript = ""; // reset for next utterance

@@ -1,4 +1,8 @@
 import { Router } from 'express';
+import os from 'os';
+import path from 'path';
+import fs from 'fs/promises';
+import { randomBytes } from 'crypto';
 import { extractTextFromPDF } from "../lib/pipeline/pdfLoader.js";
 import { splitText } from "../lib/pipeline/textSplitter.js";
 import { storeDocuments } from "../lib/pipeline/vectorStore.js";
@@ -17,12 +21,21 @@ export function createUploadRoutes({ sessionCache, upload }) {
                 return res.status(400).json({ error: 'No PDF file uploaded' });
             }
 
-            uploadLog.info({ filename: req.file.filename, originalName: req.file.originalname, size: req.file.size }, 'Upload processing started');
-            const sessionId = req.file.filename;
+            uploadLog.info({ originalName: req.file.originalname, size: req.file.size }, 'Upload processing started');
+            const sessionId = randomBytes(12).toString('hex') + '-' + Date.now();
+
+            // Write buffer to temp file for PDF extraction, then clean up
+            const tmpPath = path.join(os.tmpdir(), `rag-${sessionId}.pdf`);
+            await fs.writeFile(tmpPath, req.file.buffer);
 
             // Step 1: PDF extraction
             const extractStart = performance.now();
-            const text = await extractTextFromPDF(req.file.path);
+            let text;
+            try {
+                text = await extractTextFromPDF(tmpPath);
+            } finally {
+                fs.unlink(tmpPath).catch(() => {});
+            }
             const extractMs = Math.round(performance.now() - extractStart);
             uploadLog.info({ step: 'extract', durationMs: extractMs, pages: text.length }, 'PDF text extracted');
 
@@ -53,7 +66,7 @@ export function createUploadRoutes({ sessionCache, upload }) {
                     const doc = await saveDocument({
                         userId: req.user.id,
                         sessionId,
-                        filename: req.file.filename,
+                        filename: req.file.originalname,
                         originalName: req.file.originalname,
                         qdrantCollection: sessionId,
                         chunkCount: docs.length
