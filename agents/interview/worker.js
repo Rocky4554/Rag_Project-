@@ -6,7 +6,8 @@ import { DeepgramSTT } from "./stt.js";
 import { AudioPublisher } from "../shared/audioPublisher.js";
 import { generatePCM, generatePCMPipelined } from "./tts.js";
 import { SessionBridge } from "./sessionBridge.js";
-import { parseTTSResponse } from "../../lib/interview/interviewAgent.js";
+import { parseTTSResponse, checkTTSCache } from "../../lib/interview/interviewAgent.js";
+import { mp3ToPCM } from "./mp3ToPCM.js";
 import { agentLog } from "../../lib/logger.js";
 
 // Spoken text for cached TTS phrase keys.
@@ -57,16 +58,20 @@ function hasSignificantAudio(int16Array) {
 
 export class InterviewAgentWorker {
     /**
-     * @param {string} sessionId - Unique room name / interview session
+     * @param {string} sessionId    - Unique room name / interview session
      * @param {Object} sessionCache - Ref to the server.js global sessionCache
      * @param {Object} agentWorkflow - Ref to the compiled LangGraph workflow
-     * @param {Object} io - Socket.io instance for UI updates (optional)
+     * @param {Object} io           - Socket.io instance for UI updates (optional)
+     * @param {string} candidateName - Candidate's name for the personalised intro
+     * @param {number} maxQuestions  - Total questions in this interview (used in intro text)
      */
-    constructor(sessionId, sessionCache, agentWorkflow, io) {
+    constructor(sessionId, sessionCache, agentWorkflow, io, candidateName = "there", maxQuestions = 5) {
         this.sessionId = sessionId;
         this.sessionCache = sessionCache;
         this.sessionBridge = new SessionBridge(sessionId, sessionCache, agentWorkflow);
         this.io = io;
+        this.candidateName = candidateName;
+        this.maxQuestions = maxQuestions;
 
         this.room = new Room();
         this.stt = new DeepgramSTT();
@@ -75,6 +80,9 @@ export class InterviewAgentWorker {
 
         this.isActive = false;
         this.processingTurn = false;
+
+        // Tracks the last question spoken so we can repeat it on pardon/repeat requests
+        this.currentQuestion = "";
 
         // Improvement #4: track when AI last finished speaking so we can compute
         // timeToAnswer = elapsed since AI finished → user's STT transcript received
@@ -233,6 +241,15 @@ export class InterviewAgentWorker {
         const turnStart = performance.now();
         this.processingTurn = true;
 
+        // Safety: if LLM or TTS hangs, don't block the interview indefinitely.
+        // After 30s we reset the flag so new user speech can be processed again.
+        const safetyTimer = setTimeout(() => {
+            if (this.processingTurn) {
+                agentLog.warn({ sessionId: this.sessionId }, 'processingTurn safety timeout — resetting flag');
+                this.processingTurn = false;
+            }
+        }, 30000);
+
         agentLog.info({
             sessionId: this.sessionId,
             transcript: transcript.substring(0, 150),
@@ -250,6 +267,19 @@ export class InterviewAgentWorker {
         }
 
         try {
+            // ── Fast-path: pardon / repeat request ─────────────────────────────────
+            // Intercept before LangGraph so we never accidentally advance state or
+            // trigger the final report on the last question just because the user
+            // asked us to repeat it.
+            const lowerAns = transcript.trim().toLowerCase().replace(/[^a-z\s]/g, "").trim();
+            if (this.currentQuestion && /\b(pardon|repeat|say again|say that again|can you repeat|what was the question|come again|once more)\b/.test(lowerAns)) {
+                agentLog.info({ sessionId: this.sessionId, transcript: transcript.substring(0, 80) }, 'Pardon/repeat request — re-speaking current question');
+                this.io?.to(this.sessionId).emit('ai_state', { state: 'speaking', text: 'Repeating question...' });
+                await this._speakAndEmit(this.currentQuestion);
+                this.io?.to(this.sessionId).emit('ai_state', { state: 'listening', text: 'Your turn...' });
+                return;
+            }
+
             // 1. Process via LangGraph (pass acoustic metadata for behavioral context)
             const result = await this.sessionBridge.processUserTranscript(transcript, acousticMeta);
             const processMs = Math.round(performance.now() - turnStart);
@@ -309,8 +339,19 @@ export class InterviewAgentWorker {
                     }
                 }
 
-                for await (const { pcm } of generatePCMPipelined("Thank you for your time. The interview is now complete. You can review your report on the screen.", "16000")) {
-                    await this._playAudio(pcm);
+                // Play interview_outro.mp3 for normal completion, or
+                // interview_stopped.mp3 when the user explicitly requested to stop.
+                const isStoppedByUser = result.intent === 'stop' || result.intent === 'unwell';
+                if (isStoppedByUser) {
+                    await this._playFileOrFallback(
+                        'interview_stopped',
+                        "Of course. As you requested, we will end the interview here. Thank you so much for your time today. I wish you all the best."
+                    );
+                } else {
+                    await this._playFileOrFallback(
+                        'interview_outro',
+                        "Thank you for completing the interview. That concludes all our questions. You can now review your full report on the screen. Well done and good luck!"
+                    );
                 }
 
                 setTimeout(() => this.stop(), 2000);
@@ -337,9 +378,7 @@ export class InterviewAgentWorker {
                 if (this.io) {
                     this.io.to(this.sessionId).emit('ai_state', { state: 'speaking', text: 'AI Speaking...' });
                 }
-                for await (const { pcm } of generatePCMPipelined(spokenText, "16000")) {
-                    await this._playAudio(pcm);
-                }
+                await this._speakAndEmit(spokenText);
                 if (this.io) {
                     this.io.to(this.sessionId).emit('ai_state', { state: 'listening', text: 'Your turn...' });
                 }
@@ -348,13 +387,10 @@ export class InterviewAgentWorker {
                 // ── confused / meta / irrelevant — speak response, stay on same question ──
                 const feedbackText = result.evaluation?.feedback || "";
                 if (this.io) {
-                    this.io.to(this.sessionId).emit('transcript_final', { role: 'ai', text: feedbackText });
                     this.io.to(this.sessionId).emit('ai_state', { state: 'speaking', text: 'AI Speaking...' });
                 }
                 if (feedbackText) {
-                    for await (const { pcm } of generatePCMPipelined(feedbackText, "16000")) {
-                        await this._playAudio(pcm);
-                    }
+                    await this._speakAndEmit(feedbackText);
                 }
                 if (this.io) {
                     this.io.to(this.sessionId).emit('ai_state', { state: 'listening', text: 'Your turn to speak...' });
@@ -363,7 +399,6 @@ export class InterviewAgentWorker {
             } else {
                 // ── Next question — speak feedback phrase + new question ────────────
                 if (this.io) {
-                    this.io.to(this.sessionId).emit('transcript_final', { role: 'ai', text: result.nextQuestion });
                     this.io.to(this.sessionId).emit('ai_state', { state: 'speaking', text: 'AI Speaking...' });
                 }
 
@@ -386,28 +421,36 @@ export class InterviewAgentWorker {
                 const feedbackText = `${feedbackPhrases} ${parsedFeedback.uniquePart}`.trim();
                 const questionText = `${questionPhrases} ${parsedQuestion.uniquePart}`.trim();
 
-                // Play feedback phrase first (short, fast TTS) while question TTS generates
+                // Track for pardon/repeat requests
+                if (questionText) this.currentQuestion = questionText;
+
+                // Start the AI turn — feedback + question are one logical turn
+                this.io?.to(this.sessionId).emit('ai_speech', { action: 'start' });
+
                 if (feedbackText && questionText) {
                     agentLog.info({ sessionId: this.sessionId, feedback: feedbackText.substring(0, 80), question: questionText.substring(0, 80) }, 'TTS parallel (feedback + question)');
                     // Start question TTS generation in background while we play feedback
                     const questionTTSPromise = generatePCM(questionText, "16000");
 
-                    // Play short feedback immediately
+                    // Emit + play short feedback immediately
+                    this.io?.to(this.sessionId).emit('ai_speech', { action: 'sentence', text: feedbackText });
                     const feedbackPcm = await generatePCM(feedbackText, "16000");
                     if (feedbackPcm) await this._playAudio(feedbackPcm);
 
-                    // Question PCM should be ready by now (or soon)
+                    // Emit + play question (PCM should be ready by now)
+                    this.io?.to(this.sessionId).emit('ai_speech', { action: 'sentence', text: questionText });
                     const questionPcm = await questionTTSPromise;
                     if (questionPcm) await this._playAudio(questionPcm);
                 } else {
                     const spokenText = `${feedbackText} ${questionText}`.trim();
                     if (spokenText) {
                         agentLog.info({ sessionId: this.sessionId, text: spokenText.substring(0, 80) }, 'TTS pipelined generation');
-                        for await (const { pcm } of generatePCMPipelined(spokenText, "16000")) {
-                            await this._playAudio(pcm);
-                        }
+                        // start/end already handled — only emit sentences
+                        await this._speakAndEmit(spokenText, false, false);
                     }
                 }
+
+                this.io?.to(this.sessionId).emit('ai_speech', { action: 'end' });
 
                 if (this.io) {
                     this.io.to(this.sessionId).emit('ai_state', { state: 'listening', text: 'Listening...' });
@@ -420,20 +463,114 @@ export class InterviewAgentWorker {
         } catch (err) {
             agentLog.error({ sessionId: this.sessionId, err: err.message }, 'Turn error');
         } finally {
+            clearTimeout(safetyTimer);
             this.processingTurn = false;
         }
     }
 
     /**
-     * Sends PCM audio via both LiveKit (WebRTC) and records when AI finished speaking.
-     * Improvement #4: aiStoppedSpeakingAt timestamp is used to compute timeToAnswer.
+     * Sends PCM audio via LiveKit and records when AI finished speaking.
      */
     async _playAudio(pcm) {
         if (!pcm) return;
-        // LiveKit WebRTC — primary audio path
         await this.audioPublisher.pushPCM(pcm);
-        // Record when AI last finished a chunk — used to compute timeToAnswer
         this.aiStoppedSpeakingAt = Date.now();
+    }
+
+    /**
+     * Speaks `text` sentence-by-sentence via pipelined TTS, emitting
+     * `ai_speech` socket events so the frontend transcript updates in sync
+     * with the actual audio playback.
+     *
+     * Events emitted:
+     *   { action: 'start' }             — new AI turn beginning
+     *   { action: 'sentence', text }    — one sentence about to play
+     *   { action: 'end' }               — turn finished
+     *
+     * @param {string}  text        - Clean text (no [tags])
+     * @param {boolean} emitStart   - Emit 'start' event (default true). Pass false
+     *                                when chaining multiple calls inside one turn.
+     * @param {boolean} emitEnd     - Emit 'end' event (default true).
+     */
+    async _speakAndEmit(text, emitStart = true, emitEnd = true) {
+        if (!text) return;
+        if (emitStart) this.io?.to(this.sessionId).emit('ai_speech', { action: 'start' });
+        for await (const { pcm, text: sentence } of generatePCMPipelined(text, "16000")) {
+            this.io?.to(this.sessionId).emit('ai_speech', { action: 'sentence', text: sentence });
+            await this._playAudio(pcm);
+        }
+        if (emitEnd) this.io?.to(this.sessionId).emit('ai_speech', { action: 'end' });
+    }
+
+    /**
+     * Plays interview_intro.mp3 with the candidate's name woven in via Polly,
+     * then speaks the first question.
+     * Called fire-and-forget from routes/interview.js instead of speak().
+     */
+    async speakIntro(firstQuestion) {
+        if (!firstQuestion) return;
+        this.processingTurn = true;
+        const safetyTimer = setTimeout(() => {
+            if (this.processingTurn) {
+                agentLog.warn({ sessionId: this.sessionId }, 'speakIntro safety timeout — resetting');
+                this.processingTurn = false;
+            }
+        }, 30000);
+        try {
+            // Personalised intro generated via Polly so the candidate's name is spoken correctly.
+            // interview_intro.mp3 is a static file (no name), so we regenerate with the name here.
+            const introText = `Hello, ${this.candidateName}! Welcome to your AI voice interview. I will ask you ${this.maxQuestions} questions based on the document you uploaded. Please answer each question clearly after I finish speaking. Let's begin!`;
+            agentLog.info({ sessionId: this.sessionId, candidateName: this.candidateName }, 'Speaking personalised intro');
+            // Intro + first question are one AI turn — emit start once, sentences as they play
+            this.io?.to(this.sessionId).emit('ai_speech', { action: 'start' });
+            for await (const { pcm, text: sentence } of generatePCMPipelined(introText, "16000")) {
+                this.io?.to(this.sessionId).emit('ai_speech', { action: 'sentence', text: sentence });
+                await this._playAudio(pcm);
+            }
+            // Speak the first question
+            const parsed = parseTTSResponse(firstQuestion);
+            const phrases = (parsed.phraseKeys || []).map(k => PHRASE_TEXT[k] || "").join(" ");
+            const spokenQuestion = (`${phrases} ${parsed.uniquePart}`).trim();
+            if (spokenQuestion) this.currentQuestion = spokenQuestion;
+            if (spokenQuestion) {
+                for await (const { pcm, text: sentence } of generatePCMPipelined(spokenQuestion, "16000")) {
+                    this.io?.to(this.sessionId).emit('ai_speech', { action: 'sentence', text: sentence });
+                    await this._playAudio(pcm);
+                }
+            }
+            this.io?.to(this.sessionId).emit('ai_speech', { action: 'end' });
+        } catch (err) {
+            agentLog.error({ sessionId: this.sessionId, err: err.message }, 'speakIntro error');
+        } finally {
+            clearTimeout(safetyTimer);
+            this.processingTurn = false;
+        }
+    }
+
+    /**
+     * Tries to play a cached MP3 phrase through LiveKit (decoded via ffmpeg).
+     * Falls back to generating the fallbackText via Polly TTS if ffmpeg is unavailable.
+     *
+     * @param {string} phraseKey    - Key matching an entry in TTS_PHRASE_CACHE (e.g. 'interview_outro')
+     * @param {string} fallbackText - Text to synthesise via Polly if the MP3 can't be decoded
+     */
+    async _playFileOrFallback(phraseKey, fallbackText) {
+        this.io?.to(this.sessionId).emit('ai_speech', { action: 'start' });
+        const filePath = checkTTSCache(phraseKey);
+        if (filePath) {
+            const pcm = await mp3ToPCM(filePath, 16000);
+            if (pcm) {
+                agentLog.info({ sessionId: this.sessionId, phraseKey }, 'Playing cached MP3 phrase');
+                this.io?.to(this.sessionId).emit('ai_speech', { action: 'sentence', text: fallbackText });
+                await this._playAudio(pcm);
+                this.io?.to(this.sessionId).emit('ai_speech', { action: 'end' });
+                return;
+            }
+        }
+        // ffmpeg not available or file missing — fall back to Polly
+        agentLog.info({ sessionId: this.sessionId, phraseKey }, 'MP3 unavailable, using Polly fallback');
+        await this._speakAndEmit(fallbackText, false, false);
+        this.io?.to(this.sessionId).emit('ai_speech', { action: 'end' });
     }
 
     async speak(text) {
@@ -446,10 +583,7 @@ export class InterviewAgentWorker {
 
             if (fullText) {
                 agentLog.info({ sessionId: this.sessionId, text: fullText.substring(0, 80) }, 'Speaking (pipelined)');
-                // Stream sentence-by-sentence: play first sentence ASAP while rest generates
-                for await (const { pcm } of generatePCMPipelined(fullText, "16000")) {
-                    await this._playAudio(pcm);
-                }
+                await this._speakAndEmit(fullText);
             }
         } catch (err) {
             agentLog.error({ sessionId: this.sessionId, err: err.message }, 'speak() error');

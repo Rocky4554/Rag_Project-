@@ -54,15 +54,22 @@ export function createInterviewRoutes({ sessionCache, activeAgents, clientReadyR
                 timeGreeting,
             };
 
-            // thread_id for LangSmith tracing + PostgresSaver checkpointing
-            const config = { configurable: { thread_id: sessionId } };
+            // Use a unique thread_id per interview run so the PostgresSaver checkpointer
+            // never restores stale state (old finalReport, interviewStopped=true, old userAnswer)
+            // from a previous interview on the same sessionId.
+            const interviewRunId = `${sessionId}_${Date.now()}`;
+            const config = { configurable: { thread_id: interviewRunId } };
 
             // Kill previous agent if exists
             if (activeAgents.has(sessionId)) {
                 activeAgents.get(sessionId).stop();
             }
 
-            const agent = new InterviewAgentWorker(sessionId, sessionCache, interviewAgent, io);
+            const agent = new InterviewAgentWorker(
+                sessionId, sessionCache, interviewAgent, io,
+                initialState.candidateName,
+                initialState.maxQuestions
+            );
             activeAgents.set(sessionId, agent);
 
             // Store save callback so the agent worker can save results when interview ends
@@ -116,7 +123,6 @@ export function createInterviewRoutes({ sessionCache, activeAgents, clientReadyR
 
             // Agent is already connected — speak first question immediately
             const { uniquePart } = parseTTSResponse(resultState.currentQuestion);
-            io.to(sessionId).emit('transcript_final', { role: 'ai', text: uniquePart });
 
             // Wait for client audio ready (reduced from 10s to 2s)
             interviewLog.info({ sessionId }, 'Waiting for client audio ready');
@@ -133,8 +139,9 @@ export function createInterviewRoutes({ sessionCache, activeAgents, clientReadyR
 
             interviewLog.info({ sessionId }, 'Speaking first question');
             // Fire-and-forget — don't block the response
-            agent.speak("Hello! Welcome to your AI voice interview. " + uniquePart).catch(err => {
-                interviewLog.error({ err: err.message, sessionId }, 'Agent speak error');
+            // speakIntro plays the personalised intro (with candidate name) then the first question.
+            agent.speakIntro(uniquePart).catch(err => {
+                interviewLog.error({ err: err.message, sessionId }, 'Agent speakIntro error');
             });
 
             res.json({

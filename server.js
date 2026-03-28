@@ -118,6 +118,11 @@ app.use(express.json({ limit: '5mb' }));
 app.use(httpLogger);
 app.use(express.static(path.join(__dirname, 'public')));
 
+// ── Health check (before all route handlers) ────────────────────
+app.get('/ping', (req, res) => {
+    res.json({ status: 'ok', message: 'pong', timestamp: new Date().toISOString() });
+});
+
 // ── Rate limiters ────────────────────────────────────────────────
 const apiLimiter = rateLimit({
     windowMs: 1 * 60 * 1000, // 1 minute

@@ -91,7 +91,7 @@ export async function* generatePCMPipelined(text, sampleRate = "16000") {
 
     if (sentences.length === 1) {
         const pcm = await generatePCM(sentences[0], sampleRate);
-        if (pcm) yield { pcm, index: 0 };
+        if (pcm) yield { pcm, index: 0, text: sentences[0] };
         return;
     }
 
@@ -131,7 +131,7 @@ export async function* generatePCMPipelined(text, sampleRate = "16000") {
     for (let i = 0; i < sentences.length; i++) {
         await readyPromises[i];
         if (results[i]?.pcm) {
-            yield results[i];
+            yield { ...results[i], text: sentences[i] };
         }
     }
 }
