@@ -112,7 +112,7 @@ app.use(helmet({
     contentSecurityPolicy: false, // allow inline scripts in public/index.html
     crossOriginEmbedderPolicy: false
 }));
-app.use(cors({ origin: allowedOrigins, methods: ['GET', 'POST'], credentials: true }));
+app.use(cors({ origin: allowedOrigins, methods: ['GET', 'POST', 'DELETE'], credentials: true }));
 app.use(cookieParser());
 app.use(express.json({ limit: '5mb' }));
 app.use(httpLogger);

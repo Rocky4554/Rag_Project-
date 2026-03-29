@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { requireAuth } from '../middleware/auth.js';
-import { getUserDocuments, getInterviewResults, getQuizResults, getRecentActivity } from '../lib/db.js';
+import { getUserDocuments, getInterviewResults, getQuizResults, getRecentActivity, deleteDocument, getDocumentBySessionId } from '../lib/db.js';
 import { serverLog } from '../lib/logger.js';
 
 const mapDocument = (d) => ({
@@ -54,6 +54,35 @@ export function createHistoryRoutes() {
         } catch (error) {
             serverLog.error({ err: error.message }, 'History documents error');
             res.status(500).json({ error: 'Failed to load documents' });
+        }
+    });
+
+    // ── Delete a document and its related data ──────────────────────
+    router.delete('/history/documents/:sessionId', requireAuth, async (req, res) => {
+        try {
+            const doc = await getDocumentBySessionId(req.params.sessionId);
+            if (!doc) return res.status(404).json({ error: 'Document not found' });
+            if (doc.user_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
+
+            await deleteDocument(doc.id, req.user.id);
+
+            // Try to delete Qdrant collection (best-effort)
+            if (doc.qdrant_collection && process.env.QDRANT_URL) {
+                try {
+                    const resp = await fetch(`${process.env.QDRANT_URL}/collections/${doc.qdrant_collection}`, {
+                        method: 'DELETE',
+                        headers: process.env.QDRANT_API_KEY ? { 'api-key': process.env.QDRANT_API_KEY } : {},
+                    });
+                    serverLog.info({ collection: doc.qdrant_collection, status: resp.status }, 'Qdrant collection deleted');
+                } catch (qdrantErr) {
+                    serverLog.warn({ err: qdrantErr.message, collection: doc.qdrant_collection }, 'Qdrant cleanup failed (non-critical)');
+                }
+            }
+
+            res.json({ success: true });
+        } catch (error) {
+            serverLog.error({ err: error.message, sessionId: req.params.sessionId }, 'Delete document error');
+            res.status(500).json({ error: 'Failed to delete document' });
         }
     });
 
