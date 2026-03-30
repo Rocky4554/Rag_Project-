@@ -44,16 +44,21 @@ export class DeepgramSTT extends EventEmitter {
         const apiKey = process.env.DEEPGRAM_API_KEY;
         if (!apiKey) throw new Error("DEEPGRAM_API_KEY is missing");
 
+        const sampleRate = process.env.DEEPGRAM_STT_SAMPLE_RATE || "48000";
+
         const params = new URLSearchParams({
             encoding: "linear16",
-            sample_rate: "48000",   // LiveKit track output is 48kHz by default
+            sample_rate: sampleRate,
             channels: "1",
             model: this.model,
             language: this.language,
             smart_format: String(this.smartFormat),
-            filler_words: "true",   // Improvement #2: keep uh/um/er in transcript for filler detection
+            filler_words: "true",
             interim_results: "true",
             endpointing: String(this.endpointing),
+            // utterance_end_ms: extra silence buffer after speech_final detection
+            // Gives more time for natural pauses in longer answers
+            utterance_end_ms: process.env.DEEPGRAM_STT_UTTERANCE_END_MS || "1500",
         });
 
         const url = `wss://api.deepgram.com/v1/listen?${params.toString()}`;
