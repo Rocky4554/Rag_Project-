@@ -1,0 +1,63 @@
+
+  SSH into your EC2 instance and run:
+
+  # Install Docker
+  sudo yum update -y          # Amazon Linux / sudo apt update for Ubuntu
+  sudo yum install -y docker  # or sudo apt install -y docker.io
+  sudo systemctl start docker
+  sudo systemctl enable docker
+  sudo usermod -aG docker $USER
+
+  # Log out and back in for group to take effect, then:
+
+  # Login to GHCR (create a GitHub PAT with read:packages scope)
+  docker login ghcr.io -u YOUR_GITHUB_USERNAME -p YOUR_GITHUB_PAT
+
+  # Create env file directory
+  mkdir -p ~/rag-app
+
+  # Create your .env file on the server
+  nano ~/rag-app/.env
+  # Paste all your env vars from your local .env file
+
+  3. GitHub Secrets
+
+  Go to your repo → Settings → Secrets and variables → Actions and add these secrets:    
+
+  ┌──────────────┬────────────────────────────────────────────────────┐
+  │    Secret    │                       Value                        │
+  ├──────────────┼────────────────────────────────────────────────────┤
+  │ EC2_HOST     │ Your EC2 public IP or domain (e.g. 54.123.45.67)   │
+  ├──────────────┼────────────────────────────────────────────────────┤
+  │ EC2_USERNAME │ SSH user (e.g. ubuntu or ec2-user)                 │
+  ├──────────────┼────────────────────────────────────────────────────┤
+  │ EC2_SSH_KEY  │ Your EC2 private key (the full .pem file contents) │
+  └──────────────┴────────────────────────────────────────────────────┘
+
+  GITHUB_TOKEN is automatically available — no need to add it.
+
+  4. Make Your GHCR Package Public (optional)
+
+  If your repo is private, the image is private by default. The EC2 docker login step    
+  handles auth. If you want it public, go to GitHub → Packages → Package settings →      
+  Change visibility.
+
+  5. Deploy
+
+  Just push to main:
+
+  git add .
+  git commit -m "Add Docker and CI/CD pipeline"
+  git push origin main
+
+  The workflow will:
+  1. Build your Docker image
+  2. Push it to ghcr.io/your-username/rag_project:latest
+  3. SSH into your EC2, pull the new image, and restart the container
+
+  ---
+  Important notes:
+  - Your .env file lives only on the EC2 server at ~/rag-app/.env — never in the repo    
+  - Make sure EC2 security group allows inbound on port 5000 (and 22 for SSH)
+  - If you need a package-lock.json (you likely do for npm ci), run npm install locally  
+  first to generate it, then commit it

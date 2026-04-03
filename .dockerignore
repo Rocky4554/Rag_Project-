@@ -1,0 +1,13 @@
+node_modules
+.env
+.env.*
+.git
+.github
+.cache
+uploads
+dev_docs
+scripts
+assets/tts
+*.md
+.gitignore
+.dockerignore
