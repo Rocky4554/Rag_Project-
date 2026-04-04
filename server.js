@@ -212,7 +212,7 @@ async function startServer() {
 
     app.use('/api', apiLimiter);
     app.use('/api', createTokenRoutes());
-    app.use('/api', createHistoryRoutes());
+    app.use('/api', createHistoryRoutes(deps));
     app.use('/api', createSessionRoutes(deps));
 
     // Global error handler (must be last)

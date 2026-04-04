@@ -1,11 +1,67 @@
 import { Router } from 'express';
-import { AccessToken } from 'livekit-server-sdk';
+import { AccessToken, RoomServiceClient } from 'livekit-server-sdk';
 import { VoiceAgentWorker } from '../agents/voice/worker.js';
 import { optionalAuth } from '../middleware/auth.js';
 import { ensureSession } from '../lib/sessionRestore.js';
 import { agentLog } from '../lib/logger.js';
 
-export function createVoiceAgentRoutes({ sessionCache, activeVoiceAgents, io }) {
+// LiveKit Room Service client for server-side room/participant management
+const roomService = (process.env.LIVEKIT_URL && process.env.LIVEKIT_API_KEY && process.env.LIVEKIT_API_SECRET)
+    ? new RoomServiceClient(
+        process.env.LIVEKIT_URL.replace('wss://', 'https://'),
+        process.env.LIVEKIT_API_KEY,
+        process.env.LIVEKIT_API_SECRET
+    )
+    : null;
+
+/**
+ * Forcibly clean up all agents and their LiveKit participants for a session.
+ * Best practice per LiveKit docs: use RoomServiceClient.removeParticipant()
+ * to immediately disconnect stale agent participants from the room, then
+ * stop the in-process worker.
+ */
+async function cleanupSessionAgents(sessionId, { activeAgents, activeVoiceAgents }) {
+    const cleanups = [];
+
+    // Stop interview agent worker + kick its LiveKit participant
+    if (activeAgents.has(sessionId)) {
+        const agent = activeAgents.get(sessionId);
+        agentLog.info({ sessionId }, 'Cleaning up active interview agent');
+        agent.stop();
+        activeAgents.delete(sessionId);
+        if (roomService) {
+            cleanups.push(
+                roomService.removeParticipant(sessionId, 'ai-interviewer')
+                    .catch(() => {}) // may already be gone
+            );
+        }
+    }
+
+    // Stop voice agent worker + kick its LiveKit participant
+    if (activeVoiceAgents.has(sessionId)) {
+        const agent = activeVoiceAgents.get(sessionId);
+        agentLog.info({ sessionId }, 'Cleaning up active voice agent');
+        agent.stop();
+        activeVoiceAgents.delete(sessionId);
+        if (roomService) {
+            cleanups.push(
+                roomService.removeParticipant(sessionId, 'voice-agent')
+                    .catch(() => {})
+            );
+        }
+    }
+
+    // Wait for LiveKit to process the removals
+    if (cleanups.length > 0) {
+        await Promise.all(cleanups);
+        // Small delay to let LiveKit propagate disconnection before new agent joins
+        await new Promise(r => setTimeout(r, 500));
+    }
+}
+
+export { cleanupSessionAgents };
+
+export function createVoiceAgentRoutes({ sessionCache, activeAgents, activeVoiceAgents, io }) {
     const router = Router();
 
     // POST /api/voice-agent/start
@@ -22,11 +78,8 @@ export function createVoiceAgentRoutes({ sessionCache, activeVoiceAgents, io }) 
 
             agentLog.info({ sessionId, userId: req.user?.id, type: 'voice' }, 'Voice agent start requested');
 
-            // Stop existing agent if running
-            if (activeVoiceAgents.has(sessionId)) {
-                activeVoiceAgents.get(sessionId).stop();
-                activeVoiceAgents.delete(sessionId);
-            }
+            // Clean up ALL existing agents on this session before starting a new one
+            await cleanupSessionAgents(sessionId, { activeAgents, activeVoiceAgents });
 
             // Create and start the voice agent worker (connects LiveKit + Gemini Live)
             const worker = new VoiceAgentWorker(
@@ -78,6 +131,11 @@ export function createVoiceAgentRoutes({ sessionCache, activeVoiceAgents, io }) 
                 activeVoiceAgents.get(sessionId).stop();
                 activeVoiceAgents.delete(sessionId);
                 agentLog.info({ sessionId, type: 'voice' }, 'Voice agent stopped');
+            }
+
+            // Also kick the voice-agent participant from LiveKit room
+            if (roomService) {
+                roomService.removeParticipant(sessionId, 'voice-agent').catch(() => {});
             }
 
             res.json({ stopped: true });

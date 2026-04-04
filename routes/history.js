@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { requireAuth } from '../middleware/auth.js';
 import { getUserDocuments, getInterviewResults, getQuizResults, getRecentActivity, deleteDocument, getDocumentBySessionId } from '../lib/db.js';
 import { serverLog } from '../lib/logger.js';
+import { cleanupSessionAgents } from './voiceAgent.js';
 
 const mapDocument = (d) => ({
     id: d.id,
@@ -43,7 +44,7 @@ const mapActivity = (a) => ({
     createdAt: a.created_at,
 });
 
-export function createHistoryRoutes() {
+export function createHistoryRoutes({ sessionCache, activeAgents, activeVoiceAgents } = {}) {
     const router = Router();
 
     // ── Get all user documents ──────────────────────────────────────
@@ -66,16 +67,39 @@ export function createHistoryRoutes() {
 
             await deleteDocument(doc.id, req.user.id);
 
-            // Try to delete Qdrant collection (best-effort)
-            if (doc.qdrant_collection && process.env.QDRANT_URL) {
-                try {
-                    const resp = await fetch(`${process.env.QDRANT_URL}/collections/${doc.qdrant_collection}`, {
-                        method: 'DELETE',
-                        headers: process.env.QDRANT_API_KEY ? { 'api-key': process.env.QDRANT_API_KEY } : {},
-                    });
-                    serverLog.info({ collection: doc.qdrant_collection, status: resp.status }, 'Qdrant collection deleted');
-                } catch (qdrantErr) {
-                    serverLog.warn({ err: qdrantErr.message, collection: doc.qdrant_collection }, 'Qdrant cleanup failed (non-critical)');
+            const sessionId = req.params.sessionId;
+
+            // Stop any active agents on this session
+            if (activeAgents && activeVoiceAgents) {
+                await cleanupSessionAgents(sessionId, { activeAgents, activeVoiceAgents }).catch(() => {});
+            }
+
+            // Clear from in-memory session cache
+            if (sessionCache && sessionCache[sessionId]) {
+                delete sessionCache[sessionId];
+                serverLog.info({ sessionId }, 'Session cleared from cache');
+            }
+
+            // Try to delete Qdrant collections (text + image, best-effort)
+            if (process.env.QDRANT_URL) {
+                const headers = process.env.QDRANT_API_KEY ? { 'api-key': process.env.QDRANT_API_KEY } : {};
+                const collections = [doc.qdrant_collection].filter(Boolean);
+                // Also try the -img variant for image uploads
+                if (doc.qdrant_collection && !doc.qdrant_collection.endsWith('-img')) {
+                    collections.push(doc.qdrant_collection + '-img');
+                }
+                for (const col of collections) {
+                    try {
+                        const resp = await fetch(`${process.env.QDRANT_URL}/collections/${col}`, {
+                            method: 'DELETE',
+                            headers,
+                        });
+                        if (resp.ok || resp.status === 404) {
+                            serverLog.info({ collection: col, status: resp.status }, 'Qdrant collection deleted');
+                        }
+                    } catch (qdrantErr) {
+                        serverLog.warn({ err: qdrantErr.message, collection: col }, 'Qdrant cleanup failed (non-critical)');
+                    }
                 }
             }
 

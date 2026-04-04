@@ -7,8 +7,9 @@ import { ensureSession } from "../lib/sessionRestore.js";
 import { updateUserProfileAfterInterview, getUserProfileContext } from "../lib/interview/profileUpdater.js";
 import { validate, interviewStartSchema } from '../lib/validation.js';
 import { interviewLog } from '../lib/logger.js';
+import { cleanupSessionAgents } from './voiceAgent.js';
 
-export function createInterviewRoutes({ sessionCache, activeAgents, clientReadyResolvers, io, interviewAgent }) {
+export function createInterviewRoutes({ sessionCache, activeAgents, activeVoiceAgents, clientReadyResolvers, io, interviewAgent }) {
     const router = Router();
 
     router.post('/interview/start', validate(interviewStartSchema), optionalAuth, async (req, res) => {
@@ -18,7 +19,10 @@ export function createInterviewRoutes({ sessionCache, activeAgents, clientReadyR
             // Try in-memory first, then auto-restore from DB+Qdrant
             const session = await ensureSession(sessionCache, sessionId);
             if (!session || !session.vectorStore) {
-                return res.status(404).json({ error: 'Session not found. Please upload the PDF again.' });
+                return res.status(404).json({ error: 'Session not found. Please upload a PDF or text document first.' });
+            }
+            if (session.contentType === 'image') {
+                return res.status(400).json({ error: 'Interview is not available for image uploads. Please upload a PDF or text document.' });
             }
 
             interviewLog.info({ sessionId, maxQuestions }, 'Starting interview');
@@ -60,10 +64,8 @@ export function createInterviewRoutes({ sessionCache, activeAgents, clientReadyR
             const interviewRunId = `${sessionId}_${Date.now()}`;
             const config = { configurable: { thread_id: interviewRunId } };
 
-            // Kill previous agent if exists
-            if (activeAgents.has(sessionId)) {
-                activeAgents.get(sessionId).stop();
-            }
+            // Clean up ALL existing agents on this session before starting a new one
+            await cleanupSessionAgents(sessionId, { activeAgents, activeVoiceAgents });
 
             const agent = new InterviewAgentWorker(
                 sessionId, sessionCache, interviewAgent, io,
