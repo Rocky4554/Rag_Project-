@@ -14,6 +14,42 @@ import { agentLog } from '../../lib/logger.js';
 
 // Override via GEMINI_LIVE_MODEL env var. Run: node scripts/listLiveModels.js to see options.
 const VOICE_MODEL = process.env.GEMINI_LIVE_MODEL || 'gemini-2.5-flash-native-audio-latest';
+
+/**
+ * Strip Gemini's internal thinking/reasoning from output transcription.
+ * Gemini sometimes includes text like:
+ *   "**Header** I'm analyzing the user's request. I'll focus on... Hello! How can I help?"
+ * This extracts only the actual conversational speech.
+ */
+function stripThinkingText(text) {
+    if (!text) return '';
+
+    // If text contains **bold headers**, it has thinking content
+    if (text.includes('**')) {
+        // Strategy: find the last occurrence of a thinking block end,
+        // then take everything after it
+        // Thinking blocks are: **Header** followed by meta-sentences
+        // Meta-sentences contain patterns like "I'm focusing on", "I've initiated", "I'll emphasize"
+
+        // Remove all **Header** markers first
+        let result = text.replace(/\*\*[^*]+\*\*/g, '');
+
+        // Split into sentences and filter out reasoning/meta sentences
+        const sentences = result.split(/(?<=[.!?])\s+/);
+        const conversational = sentences.filter(s => {
+            const lower = s.toLowerCase().trim();
+            if (!lower) return false;
+            // Skip meta-reasoning sentences
+            if (/^(i'm (now |aiming |focusing |working )|i've (initiated|clarified|identified)|my (primary |focus )|i'll (emphasize|provide|make sure|also )|it seems|this (suggests|indicates)|the user)/.test(lower)) return false;
+            if (/\b(user's intent|reframe my|selling point|disconnect)\b/.test(lower)) return false;
+            return true;
+        });
+
+        return conversational.join(' ').trim();
+    }
+
+    return text.trim();
+}
 const LIVE_API_VERSION = process.env.GEMINI_LIVE_API_VERSION || 'v1beta';
 const INPUT_SAMPLE_RATE = 16000;   // LiveKit mic → Gemini
 const OUTPUT_SAMPLE_RATE = 24000;  // Gemini audio response → LiveKit
@@ -77,6 +113,8 @@ export class VoiceAgentWorker {
                     },
                     { googleSearch: {} }
                 ],
+                // Disable thinking/reasoning to prevent internal monologue in speech
+                thinkingConfig: { thinkingBudget: 0 },
                 inputAudioTranscription: {},
                 outputAudioTranscription: {},
                 speechConfig: {
@@ -198,7 +236,8 @@ export class VoiceAgentWorker {
 - When searching the PDF, summarize the findings naturally in speech rather than reading verbatim
 - Don't read out long lists — summarize the key points instead
 - If asked something you don't know, say so honestly and offer to search the document or web
-- You can have casual conversation, answer general questions, or help the user understand their document`;
+- You can have casual conversation, answer general questions, or help the user understand their document
+- NEVER include internal reasoning, thought process headers, or meta-commentary like "Clarifying User Intent" or "Analyzing request" in your spoken response. Just speak naturally and directly to the user.`;
 
         return prompt;
     }
@@ -220,6 +259,11 @@ export class VoiceAgentWorker {
     _setupRoomEvents() {
         this.room.on(RoomEvent.TrackSubscribed, (track, _publication, participant) => {
             if (track.kind === TrackKind.KIND_AUDIO) {
+                // Only listen to the actual user — ignore our own audio and other agents
+                if (participant.identity === 'voice-agent' || participant.identity === 'ai-interviewer') {
+                    agentLog.debug({ sessionId: this.sessionId, participant: participant.identity, type: 'voice' }, 'Ignoring agent audio track');
+                    return;
+                }
                 agentLog.info({ sessionId: this.sessionId, participant: participant.identity, type: 'voice' }, 'Subscribed to user audio');
                 this._listenToUserAudio(track);
             }
@@ -293,9 +337,8 @@ export class VoiceAgentWorker {
                 }
             }
 
-            // Audio output + optional inline text from model turn parts
+            // Audio output from model turn parts
             if (msg.serverContent.modelTurn?.parts) {
-                let turnText = '';
                 for (const part of msg.serverContent.modelTurn.parts) {
                     if (part.inlineData?.mimeType?.startsWith('audio/')) {
                         const buf = Buffer.from(part.inlineData.data, 'base64');
@@ -306,13 +349,9 @@ export class VoiceAgentWorker {
                             this.io.to(this.sessionId).emit('voice_state', { state: 'speaking' });
                         }
                     }
-                    // Some models return text alongside audio
-                    if (part.text) {
-                        turnText += part.text;
-                    }
-                }
-                if (turnText && this.io) {
-                    this.io.to(this.sessionId).emit('voice_transcript', { role: 'ai', text: turnText });
+                    // NOTE: part.text is intentionally NOT emitted here.
+                    // The outputTranscription handler below is the single source
+                    // of truth for AI speech text (with thinking filtered out).
                 }
             }
 
@@ -338,17 +377,20 @@ export class VoiceAgentWorker {
             const outputText = msg.serverContent.outputTranscription?.text
                 ?? msg.serverContent.outputTranscription?.transcript;
             if (outputText) {
-                agentLog.info({ sessionId: this.sessionId, text: outputText.substring(0, 150), type: 'voice' }, '🤖 AI said');
-                if (this.io) {
-                    this.io.to(this.sessionId).emit('voice_transcript', { role: 'ai', text: outputText });
+                // Filter out Gemini's internal reasoning/thinking from transcription.
+                // Gemini sometimes emits text like:
+                //   "**Clarifying User Intent** I'm now focused on... Hello Raunak!"
+                // We need to strip the **Header** and all reasoning sentences, keeping
+                // only the conversational speech.
+                const cleaned = stripThinkingText(outputText);
 
-                    // Emit Netflix-style subtitle with synthetic word timestamps
-                    const words = outputText.trim().split(/\s+/).filter(Boolean);
-                    if (words.length > 0) {
-                        const msPerWord = 80; // ~80ms per word for natural reading pace
-                        const marks = words.map((w, i) => ({ time: i * msPerWord, value: w }));
-                        this.io.to(this.sessionId).emit('ai_subtitle', { words: marks, text: outputText });
+                if (cleaned) {
+                    agentLog.info({ sessionId: this.sessionId, text: cleaned.substring(0, 150), type: 'voice' }, '🤖 AI said');
+                    if (this.io) {
+                        this.io.to(this.sessionId).emit('voice_transcript', { role: 'ai', text: cleaned });
                     }
+                } else {
+                    agentLog.debug({ sessionId: this.sessionId, text: outputText.substring(0, 100), type: 'voice' }, 'Filtered internal reasoning');
                 }
             }
         }

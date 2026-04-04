@@ -59,6 +59,10 @@ export class DeepgramSTT extends EventEmitter {
             // utterance_end_ms: extra silence buffer after speech_final detection
             // Gives more time for natural pauses in longer answers
             utterance_end_ms: process.env.DEEPGRAM_STT_UTTERANCE_END_MS || "1500",
+            // VAD events: get notified when speech starts/stops for better turn management
+            vad_events: "true",
+            // Punctuation for cleaner transcripts
+            punctuate: "true",
         });
 
         const url = `wss://api.deepgram.com/v1/listen?${params.toString()}`;
@@ -100,30 +104,16 @@ export class DeepgramSTT extends EventEmitter {
                     }
 
                     if (msg.speech_final) {
-                        const finalAnswer = this.currentTranscript.trim();
-                        if (finalAnswer.length > 0) {
-                            const utteranceDurationMs = this._utteranceStartMs
-                                ? Date.now() - this._utteranceStartMs
-                                : 0;
+                        this._emitFinal('speech_final');
+                    }
+                }
 
-                            agentLog.info({
-                                transcript: finalAnswer.substring(0, 100),
-                                words: finalAnswer.trim().split(/\s+/).length,
-                                utteranceDurationMs,
-                                fillerWordCount: this._fillerWordCount,
-                            }, 'STT speech final');
-
-                            // Emit an object (not just a string) so worker gets acoustic metadata
-                            this.emit("transcript", {
-                                transcript: finalAnswer,
-                                utteranceDurationMs,
-                                fillerWordCount: this._fillerWordCount,
-                            });
-                        }
-                        // Reset for next utterance
-                        this.currentTranscript = "";
-                        this._utteranceStartMs = 0;
-                        this._fillerWordCount = 0;
+                // UtteranceEnd: Deepgram detected a long silence gap after the last
+                // finalized word. Acts as a safety net if speech_final didn't fire.
+                if (msg.type === "UtteranceEnd") {
+                    if (this.currentTranscript.trim().length > 0) {
+                        agentLog.info('STT UtteranceEnd fallback — flushing buffered transcript');
+                        this._emitFinal('utterance_end');
                     }
                 }
             } catch (err) {
@@ -167,6 +157,37 @@ export class DeepgramSTT extends EventEmitter {
             clearInterval(this._keepaliveTimer);
             this._keepaliveTimer = null;
         }
+    }
+
+    /**
+     * Emit the accumulated transcript as a final result and reset state.
+     */
+    _emitFinal(source) {
+        const finalAnswer = this.currentTranscript.trim();
+        if (finalAnswer.length === 0) return;
+
+        const utteranceDurationMs = this._utteranceStartMs
+            ? Date.now() - this._utteranceStartMs
+            : 0;
+
+        agentLog.info({
+            transcript: finalAnswer.substring(0, 100),
+            words: finalAnswer.trim().split(/\s+/).length,
+            utteranceDurationMs,
+            fillerWordCount: this._fillerWordCount,
+            source,
+        }, 'STT speech final');
+
+        this.emit("transcript", {
+            transcript: finalAnswer,
+            utteranceDurationMs,
+            fillerWordCount: this._fillerWordCount,
+        });
+
+        // Reset for next utterance
+        this.currentTranscript = "";
+        this._utteranceStartMs = 0;
+        this._fillerWordCount = 0;
     }
 
     /**
