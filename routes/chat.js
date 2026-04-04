@@ -6,6 +6,7 @@ import { saveChatMessage, getChatHistory, getDocumentBySessionId } from "../lib/
 import { ensureSession } from "../lib/sessionRestore.js";
 import { validate, chatSchema } from '../lib/validation.js';
 import { chatLog } from '../lib/logger.js';
+import { queryImageChat, queryImageChatStream } from '../lib/pipeline/imageChat.js';
 
 export function createChatRoutes({ sessionCache }) {
     const router = Router();
@@ -18,11 +19,11 @@ export function createChatRoutes({ sessionCache }) {
 
             // Try in-memory first, then auto-restore from DB+Qdrant
             const session = await ensureSession(sessionCache, sessionId);
-            if (!session || !session.vectorStore) {
-                return res.status(404).json({ error: 'Session not found or expired. Please upload the PDF again.' });
+            if (!session || (!session.vectorStore && session.contentType !== 'image')) {
+                return res.status(404).json({ error: 'Session not found or expired. Please upload the document again.' });
             }
 
-            chatLog.info({ sessionId, question: question.substring(0, 80), historySize: session.chatHistory.length }, 'Chat request received');
+            chatLog.info({ sessionId, question: question.substring(0, 80), historySize: session.chatHistory.length, contentType: session.contentType }, 'Chat request received');
 
             // If user is authenticated and session chatHistory is empty, restore from DB
             if (req.user && session.chatHistory.length === 0) {
@@ -42,7 +43,15 @@ export function createChatRoutes({ sessionCache }) {
             }
 
             const ragStart = performance.now();
-            const { route, answer } = await routeQuery(session, question, session.chatHistory, req.user?.name);
+            let route, answer;
+
+            // Image sessions: use multimodal Gemini instead of RAG
+            if (session.contentType === 'image') {
+                answer = await queryImageChat(session, question, session.chatHistory);
+                route = 'IMAGE';
+            } else {
+                ({ route, answer } = await routeQuery(session, question, session.chatHistory, req.user?.name));
+            }
             const ragMs = Math.round(performance.now() - ragStart);
 
             session.chatHistory.push(new HumanMessage(question));
@@ -81,11 +90,11 @@ export function createChatRoutes({ sessionCache }) {
             const { sessionId, question } = req.validated;
 
             const session = await ensureSession(sessionCache, sessionId);
-            if (!session || !session.vectorStore) {
-                return res.status(404).json({ error: 'Session not found or expired. Please upload the PDF again.' });
+            if (!session || (!session.vectorStore && session.contentType !== 'image')) {
+                return res.status(404).json({ error: 'Session not found or expired. Please upload the document again.' });
             }
 
-            chatLog.info({ sessionId, question: question.substring(0, 80), streaming: true }, 'Chat stream request received');
+            chatLog.info({ sessionId, question: question.substring(0, 80), streaming: true, contentType: session.contentType }, 'Chat stream request received');
 
             // Restore chat history from DB if needed
             if (req.user && session.chatHistory.length === 0) {
@@ -114,7 +123,12 @@ export function createChatRoutes({ sessionCache }) {
             let fullAnswer = '';
             let tokenCount = 0;
 
-            for await (const token of routeQueryStream(session, question, session.chatHistory, req.user?.name)) {
+            // Pick the right stream source based on content type
+            const streamSource = session.contentType === 'image'
+                ? queryImageChatStream(session, question, session.chatHistory)
+                : routeQueryStream(session, question, session.chatHistory, req.user?.name);
+
+            for await (const token of streamSource) {
                 fullAnswer += token;
                 tokenCount++;
                 res.write(`data: ${JSON.stringify({ token })}\n\n`);

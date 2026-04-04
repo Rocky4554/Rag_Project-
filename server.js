@@ -151,12 +151,16 @@ const uploadLimiter = rateLimit({
 });
 
 // ── Multer (memory storage — no files written to disk) ──────────
+const ALLOWED_MIMES = new Set([
+    'application/pdf',
+    'image/png', 'image/jpeg', 'image/jpg', 'image/webp', 'image/gif',
+]);
 const upload = multer({
     storage: multer.memoryStorage(),
     limits: { fileSize: 20 * 1024 * 1024 }, // 20MB max
     fileFilter: (req, file, cb) => {
-        if (file.mimetype === 'application/pdf') cb(null, true);
-        else cb(new Error('Only PDF files are allowed!'), false);
+        if (ALLOWED_MIMES.has(file.mimetype)) cb(null, true);
+        else cb(new Error('Unsupported file type. Allowed: PDF, PNG, JPG, WebP, GIF'), false);
     }
 });
 

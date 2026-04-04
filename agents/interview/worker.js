@@ -1,7 +1,7 @@
 import dotenv from "dotenv";
 
 import { VoicePipelineWorker } from "../shared/voicePipelineWorker.js";
-import { generatePCM, generatePCMPipelined } from "./tts.js";
+import { estimateWordTimings } from "./tts.js";
 import { SessionBridge } from "./sessionBridge.js";
 import { parseTTSResponse, checkTTSCache } from "../../lib/interview/interviewAgent.js";
 import { mp3ToPCM } from "./mp3ToPCM.js";
@@ -183,16 +183,9 @@ export class InterviewAgentWorker extends VoicePipelineWorker {
 
                 if (feedbackText && questionText) {
                     agentLog.info({ sessionId: this.sessionId, feedback: feedbackText.substring(0, 80), question: questionText.substring(0, 80) }, 'TTS parallel');
-                    // Start question TTS in background while we play feedback
-                    const questionTTSPromise = generatePCM(questionText, "16000");
-
-                    this._emitToRoom('ai_speech', { action: 'sentence', text: feedbackText });
-                    const feedbackPcm = await generatePCM(feedbackText, "16000");
-                    if (feedbackPcm) await this._playAudio(feedbackPcm);
-
-                    this._emitToRoom('ai_speech', { action: 'sentence', text: questionText });
-                    const questionPcm = await questionTTSPromise;
-                    if (questionPcm) await this._playAudio(questionPcm);
+                    // Speak feedback with subtitles, then question with subtitles
+                    await this._speakAndEmit(feedbackText, false, false);
+                    await this._speakAndEmit(questionText, false, false);
                 } else {
                     const spokenText = `${feedbackText} ${questionText}`.trim();
                     if (spokenText) {
@@ -224,22 +217,16 @@ export class InterviewAgentWorker extends VoicePipelineWorker {
             const introText = `Hello, ${this.candidateName}! Welcome to your AI voice interview. I will ask you ${this.maxQuestions} questions based on the document you uploaded. Please answer each question clearly after I finish speaking. Let's begin!`;
             agentLog.info({ sessionId: this.sessionId, candidateName: this.candidateName }, 'Speaking intro');
 
-            this._emitToRoom('ai_speech', { action: 'start' });
-            for await (const { pcm, text: sentence } of generatePCMPipelined(introText, "16000")) {
-                this._emitToRoom('ai_speech', { action: 'sentence', text: sentence });
-                await this._playAudio(pcm);
-            }
+            // Speak intro with subtitles
+            await this._speakAndEmit(introText, true, false);
 
-            // Speak first question
+            // Speak first question with subtitles
             const parsed = parseTTSResponse(firstQuestion);
             const phrases = (parsed.phraseKeys || []).map(k => PHRASE_TEXT[k] || "").join(" ");
             const spokenQuestion = (`${phrases} ${parsed.uniquePart}`).trim();
             if (spokenQuestion) this.currentQuestion = spokenQuestion;
             if (spokenQuestion) {
-                for await (const { pcm, text: sentence } of generatePCMPipelined(spokenQuestion, "16000")) {
-                    this._emitToRoom('ai_speech', { action: 'sentence', text: sentence });
-                    await this._playAudio(pcm);
-                }
+                await this._speakAndEmit(spokenQuestion, false, false);
             }
             this._emitToRoom('ai_speech', { action: 'end' });
         } catch (err) {
@@ -261,6 +248,9 @@ export class InterviewAgentWorker extends VoicePipelineWorker {
             if (pcm) {
                 agentLog.info({ sessionId: this.sessionId, phraseKey }, 'Playing cached MP3');
                 this._emitToRoom('ai_speech', { action: 'sentence', text: fallbackText });
+                // Emit subtitle for cached audio too
+                const marks = estimateWordTimings(fallbackText);
+                if (marks.length > 0) this._emitToRoom('ai_subtitle', { words: marks, text: fallbackText });
                 await this._playAudio(pcm);
                 this._emitToRoom('ai_speech', { action: 'end' });
                 return;

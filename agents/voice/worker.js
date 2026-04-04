@@ -341,6 +341,14 @@ export class VoiceAgentWorker {
                 agentLog.info({ sessionId: this.sessionId, text: outputText.substring(0, 150), type: 'voice' }, '🤖 AI said');
                 if (this.io) {
                     this.io.to(this.sessionId).emit('voice_transcript', { role: 'ai', text: outputText });
+
+                    // Emit Netflix-style subtitle with synthetic word timestamps
+                    const words = outputText.trim().split(/\s+/).filter(Boolean);
+                    if (words.length > 0) {
+                        const msPerWord = 80; // ~80ms per word for natural reading pace
+                        const marks = words.map((w, i) => ({ time: i * msPerWord, value: w }));
+                        this.io.to(this.sessionId).emit('ai_subtitle', { words: marks, text: outputText });
+                    }
                 }
             }
         }
