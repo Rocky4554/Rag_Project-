@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { summarizeDocs } from "../lib/interview/summarizer.js";
-import { textToAudio } from "../lib/tts/speechToAudio.js";
+import { textToAudio, audioMimeType } from "../lib/tts/speechToAudio.js";
 import { optionalAuth } from "../middleware/auth.js";
 import { logActivity } from "../lib/db.js";
 import { ensureSession } from "../lib/sessionRestore.js";
@@ -61,7 +61,7 @@ export function createSummaryRoutes({ sessionCache }) {
                 'Summary response sent'
             );
 
-            res.json({ summary, audio });
+            res.json({ summary, audio, mimeType: audioMimeType });
 
         } catch (error) {
             const totalMs = Math.round(performance.now() - routeStart);
