@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { registerVectorStore, parseTTSResponse } from "../lib/interview/interviewAgent.js";
+import { registerVectorStore, clearSessionInterviewState, parseTTSResponse } from "../lib/interview/interviewAgent.js";
 import { InterviewAgentWorker } from "../agents/interview/worker.js";
 import { optionalAuth } from "../middleware/auth.js";
 import { getDocumentBySessionId, saveInterviewResult, logActivity } from "../lib/db.js";
@@ -27,6 +27,8 @@ export function createInterviewRoutes({ sessionCache, activeAgents, activeVoiceA
 
             interviewLog.info({ sessionId, maxQuestions }, 'Starting interview');
 
+            // Purge any stale RAG cache / vectorStore from a previous interview on this session
+            clearSessionInterviewState(sessionId);
             registerVectorStore(sessionId, session.vectorStore);
 
             // Fetch cross-session user profile for personalized interview

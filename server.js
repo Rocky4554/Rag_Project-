@@ -11,7 +11,7 @@ import { Server as SocketIOServer } from 'socket.io';
 
 import { validateEnv, printEnvStatus } from './lib/env.js';
 import { serverLog, httpLogger } from './lib/logger.js';
-import { registerSocket, unregisterSocket, createInterviewAgent } from "./lib/interview/interviewAgent.js";
+import { registerSocket, unregisterSocket, createInterviewAgent, clearSessionInterviewState } from "./lib/interview/interviewAgent.js";
 import { createUploadRoutes } from './routes/upload.js';
 import { createChatRoutes } from './routes/chat.js';
 import { createQuizRoutes } from './routes/quiz.js';
@@ -67,6 +67,7 @@ setInterval(() => {
                 activeVoiceAgents.delete(id);
             }
             delete sessionCache[id];
+            clearSessionInterviewState(id);
             cleaned++;
         }
     }

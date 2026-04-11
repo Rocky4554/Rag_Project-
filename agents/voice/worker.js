@@ -334,7 +334,7 @@ export class VoiceAgentWorker {
                 this._stopSpeaking();
                 if (this.io) {
                     this.io.to(this.sessionId).emit('voice_state', { state: 'listening' });
-                }
+      t           }
             }
 
             // Audio output from model turn parts
