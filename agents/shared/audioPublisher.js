@@ -13,16 +13,25 @@ export class AudioPublisher {
         this.stopFlag = false;
         this._totalChunksSent = 0;
         this._playbackStartTime = 0;
+        this._queue = Promise.resolve();
     }
 
     /**
      * Pushes a complete raw PCM (Int16) buffer to LiveKit in 10ms AudioFrame chunks.
-     * Optimized: minimal logging per-call, batch metrics only on first/last chunk.
+     * Queues calls internally to ensure sequential playback and prevent noise.
      * @param {Int16Array} pcmData - The raw PCM data to play
      */
     async pushPCM(pcmData) {
-        const isFirstChunk = !this.isSpeaking;
-        if (isFirstChunk) {
+        // Queue the playback task to ensure serial execution
+        this._queue = this._queue.then(() => this._internalPushPCM(pcmData));
+        return this._queue;
+    }
+
+    async _internalPushPCM(pcmData) {
+        if (!pcmData || pcmData.length === 0) return;
+
+        const isFirstInSequence = !this.isSpeaking;
+        if (isFirstInSequence) {
             this.isSpeaking = true;
             this.stopFlag = false;
             this._totalChunksSent = 0;
@@ -36,9 +45,7 @@ export class AudioPublisher {
             let chunkData;
             if (offset + this.samplesPerChunk <= pcmData.length) {
                 // MUST use .slice() not .subarray() — subarray shares the parent
-                // ArrayBuffer, and livekit-rtc-node's AudioFrame.protoInfo() reads
-                // from this.data.buffer (byte 0 of the underlying buffer).  With
-                // subarray every frame would contain the same first 160 samples.
+                // ArrayBuffer, and livekit-rtc-node's AudioFrame readings from this.data.buffer.
                 chunkData = pcmData.slice(offset, offset + this.samplesPerChunk);
             } else {
                 chunkData = new Int16Array(this.samplesPerChunk);
@@ -52,17 +59,21 @@ export class AudioPublisher {
                 this.samplesPerChunk
             );
 
-            await this.source.captureFrame(frame);
-            this._totalChunksSent++;
+            try {
+                await this.source.captureFrame(frame);
+                this._totalChunksSent++;
 
-            // Precise pacing: calculate when the next chunk SHOULD be sent
-            // and wait exactly that long, avoiding event loop drift
-            const nextChunkTime = this._playbackStartTime + (this._totalChunksSent * 10);
-            const now = performance.now();
-            const delay = nextChunkTime - now;
+                // Precise pacing: calculate when the next chunk SHOULD be sent
+                const nextChunkTime = this._playbackStartTime + (this._totalChunksSent * 10);
+                const now = performance.now();
+                const delay = nextChunkTime - now;
 
-            if (delay > 0) {
-                await new Promise(resolve => setTimeout(resolve, delay));
+                if (delay > 0) {
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                }
+            } catch (err) {
+                agentLog.error({ err: err.message }, 'LiveKit captureFrame error');
+                break;
             }
         }
     }
