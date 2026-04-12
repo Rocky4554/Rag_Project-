@@ -21,7 +21,7 @@ import { createInterviewRoutes } from './routes/interview.js';
 import { createAuthRoutes } from './routes/auth.js';
 import { createHistoryRoutes } from './routes/history.js';
 import { createSessionRoutes } from './routes/session.js';
-import { createVoiceAgentRoutes } from './routes/voiceAgent.js';
+import { createConversationalAiRoutes } from './routes/conversationalAI.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -46,7 +46,7 @@ const io = new SocketIOServer(httpServer, {
 // ── Shared state ─────────────────────────────────────────────────
 const sessionCache = {};
 const activeAgents = new Map();
-const activeVoiceAgents = new Map();
+const activeConversationalAgents = new Map();
 const clientReadyResolvers = new Map();
 
 // ── Session TTL cleanup (prevents memory leak) ──────────────────
@@ -188,7 +188,7 @@ async function startServer() {
     }
 
     // ── Routes with rate limiters ────────────────────────────────
-    const deps = { sessionCache, activeAgents, activeVoiceAgents, clientReadyResolvers, io, upload, interviewAgent };
+    const deps = { sessionCache, activeAgents, activeVoiceAgents: activeConversationalAgents, clientReadyResolvers, io, upload, interviewAgent };
 
     app.use('/api/auth', authLimiter);
     app.use('/api', createAuthRoutes());
@@ -208,8 +208,8 @@ async function startServer() {
     app.use('/api/interview', llmLimiter);
     app.use('/api', createInterviewRoutes(deps));
 
-    app.use('/api/voice-agent', llmLimiter);
-    app.use('/api', createVoiceAgentRoutes(deps));
+    app.use('/api/conversational-ai', llmLimiter);
+    app.use('/api', createConversationalAiRoutes(deps));
 
     app.use('/api', apiLimiter);
     app.use('/api', createTokenRoutes());

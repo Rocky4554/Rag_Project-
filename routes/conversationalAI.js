@@ -61,11 +61,11 @@ async function cleanupSessionAgents(sessionId, { activeAgents, activeVoiceAgents
 
 export { cleanupSessionAgents };
 
-export function createVoiceAgentRoutes({ sessionCache, activeAgents, activeVoiceAgents, io }) {
+export function createConversationalAiRoutes({ sessionCache, activeAgents, activeVoiceAgents, io }) {
     const router = Router();
 
-    // POST /api/voice-agent/start
-    router.post('/voice-agent/start', optionalAuth, async (req, res) => {
+    // POST /api/conversational-ai/start
+    router.post('/conversational-ai/start', optionalAuth, async (req, res) => {
         try {
             const { sessionId } = req.body;
             if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
@@ -76,7 +76,7 @@ export function createVoiceAgentRoutes({ sessionCache, activeAgents, activeVoice
             // Try to restore session (for PDF context), but allow voice agent without a document
             await ensureSession(sessionCache, sessionId).catch(() => {});
 
-            agentLog.info({ sessionId, userId: req.user?.id, type: 'voice' }, 'Voice agent start requested');
+            agentLog.info({ sessionId, userId: req.user?.id, type: 'voice' }, 'Conversational AI start requested');
 
             // Clean up ALL existing agents on this session before starting a new one
             await cleanupSessionAgents(sessionId, { activeAgents, activeVoiceAgents });
@@ -93,7 +93,7 @@ export function createVoiceAgentRoutes({ sessionCache, activeAgents, activeVoice
 
             // Start agent in background — don't block HTTP response
             worker.start().catch(err => {
-                agentLog.error({ sessionId, err: err.message, type: 'voice' }, 'Voice agent start error');
+                agentLog.error({ sessionId, err: err.message, type: 'voice' }, 'Conversational AI start error');
                 activeVoiceAgents.delete(sessionId);
                 io.to(sessionId).emit('voice_error', { error: err.message });
             });
@@ -112,17 +112,17 @@ export function createVoiceAgentRoutes({ sessionCache, activeAgents, activeVoice
             });
             const token = await at.toJwt();
 
-            agentLog.info({ sessionId, type: 'voice' }, 'Voice agent started');
+            agentLog.info({ sessionId, type: 'voice' }, 'Conversational AI started');
             res.json({ token, url: livekitUrl, roomName: sessionId });
 
         } catch (error) {
             agentLog.error({ err: error.message, type: 'voice' }, 'Voice agent start error');
-            res.status(500).json({ error: error.message || 'Failed to start voice agent' });
+            res.status(500).json({ error: error.message || 'Failed to start Conversational AI' });
         }
     });
 
-    // POST /api/voice-agent/stop
-    router.post('/voice-agent/stop', optionalAuth, async (req, res) => {
+    // POST /api/conversational-ai/stop
+    router.post('/conversational-ai/stop', optionalAuth, async (req, res) => {
         try {
             const { sessionId } = req.body;
             if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
@@ -130,7 +130,7 @@ export function createVoiceAgentRoutes({ sessionCache, activeAgents, activeVoice
             if (activeVoiceAgents.has(sessionId)) {
                 activeVoiceAgents.get(sessionId).stop();
                 activeVoiceAgents.delete(sessionId);
-                agentLog.info({ sessionId, type: 'voice' }, 'Voice agent stopped');
+                agentLog.info({ sessionId, type: 'voice' }, 'Conversational AI stopped');
             }
 
             // Also kick the voice-agent participant from LiveKit room

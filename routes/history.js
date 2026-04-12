@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { requireAuth } from '../middleware/auth.js';
 import { getUserDocuments, getInterviewResults, getQuizResults, getRecentActivity, deleteDocument, getDocumentBySessionId } from '../lib/db.js';
 import { serverLog } from '../lib/logger.js';
-import { cleanupSessionAgents } from './voiceAgent.js';
+import { cleanupSessionAgents } from './conversationalAI.js';
 
 const mapDocument = (d) => ({
     id: d.id,

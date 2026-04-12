@@ -7,7 +7,7 @@ import { ensureSession } from "../lib/sessionRestore.js";
 import { updateUserProfileAfterInterview, getUserProfileContext } from "../lib/interview/profileUpdater.js";
 import { validate, interviewStartSchema } from '../lib/validation.js';
 import { interviewLog } from '../lib/logger.js';
-import { cleanupSessionAgents } from './voiceAgent.js';
+import { cleanupSessionAgents } from './conversationalAI.js';
 
 export function createInterviewRoutes({ sessionCache, activeAgents, activeVoiceAgents, clientReadyResolvers, io, interviewAgent }) {
     const router = Router();
@@ -25,11 +25,23 @@ export function createInterviewRoutes({ sessionCache, activeAgents, activeVoiceA
                 return res.status(400).json({ error: 'Interview is not available for image uploads. Please upload a PDF or text document.' });
             }
 
-            interviewLog.info({ sessionId, maxQuestions }, 'Starting interview');
+            // Diagnostic: trace exactly which document/collection we're using
+            const vsCollectionName = session.vectorStore?.client?.collectionName
+                || session.vectorStore?.args?.collectionName
+                || session.vectorStore?.collectionName
+                || 'unknown';
+            interviewLog.info({
+                sessionId,
+                maxQuestions,
+                originalName: session.originalName || 'unknown',
+                contentType: session.contentType || 'unknown',
+                restored: !!session._restored,
+                qdrantCollection: vsCollectionName,
+            }, 'Starting interview — session details');
 
             // Purge any stale RAG cache / vectorStore from a previous interview on this session
             clearSessionInterviewState(sessionId);
-            registerVectorStore(sessionId, session.vectorStore);
+            registerVectorStore(sessionId, session.vectorStore, session.originalName || "");
 
             // Fetch cross-session user profile for personalized interview
             let userProfileContext = "";
@@ -108,11 +120,22 @@ export function createInterviewRoutes({ sessionCache, activeAgents, activeVoiceA
                 }
             };
 
-            // === PARALLEL: Run LangGraph invoke + agent.start() concurrently ===
-            const [resultState] = await Promise.all([
-                interviewAgent.invoke(initialState, config),
-                agent.start()
-            ]);
+            // Start agent connection in background — don't block HTTP response on LiveKit
+            // LiveKit room.connect() can fail transiently (region info fetch, DNS, etc.)
+            // and should NOT cause the whole interview to 500.
+            agent.start().catch(err => {
+                interviewLog.error({ err: err.message, sessionId }, 'Agent LiveKit connection failed (background)');
+                // Retry once after a short delay
+                setTimeout(() => {
+                    interviewLog.info({ sessionId }, 'Retrying agent LiveKit connection...');
+                    agent.start().catch(err2 => {
+                        interviewLog.error({ err: err2.message, sessionId }, 'Agent LiveKit retry also failed');
+                    });
+                }, 2000);
+            });
+
+            // Only await the LangGraph invoke — this is what the HTTP response needs
+            const resultState = await interviewAgent.invoke(initialState, config);
 
             session.interviewStateConfig = config;
 

@@ -74,7 +74,7 @@ export class VoiceAgentWorker {
 
     async start() {
         const startTs = performance.now();
-        agentLog.info({ sessionId: this.sessionId }, 'VoiceAgent starting');
+        agentLog.info({ sessionId: this.sessionId }, 'Conversational AI starting');
 
         const aiOptions = { apiKey: process.env.GEMINI_API_KEY };
         if (LIVE_API_VERSION !== 'v1beta') {
@@ -99,17 +99,27 @@ export class VoiceAgentWorker {
                 systemInstruction: { parts: [{ text: systemPrompt }] },
                 tools: [
                     {
-                        functionDeclarations: [{
-                            name: 'search_pdf',
-                            description: "Search the user's uploaded PDF document for specific information",
-                            parameters: {
-                                type: 'OBJECT',
-                                properties: {
-                                    query: { type: 'STRING', description: 'Search query to find relevant content in the PDF' }
-                                },
-                                required: ['query']
+                        functionDeclarations: [
+                            {
+                                name: 'search_pdf',
+                                description: "Search the user's uploaded PDF document for specific information",
+                                parameters: {
+                                    type: 'OBJECT',
+                                    properties: {
+                                        query: { type: 'STRING', description: 'Search query to find relevant content in the PDF' }
+                                    },
+                                    required: ['query']
+                                }
+                            },
+                            {
+                                name: 'end_session',
+                                description: "End the current conversation session and disconnect gracefully when requested by the user.",
+                                parameters: {
+                                    type: 'OBJECT',
+                                    properties: {}
+                                }
                             }
-                        }]
+                        ]
                     },
                     { googleSearch: {} }
                 ],
@@ -149,13 +159,27 @@ export class VoiceAgentWorker {
             }
         });
 
-        // 3. Connect to LiveKit room
+        // 3. Connect to LiveKit room (with retry for transient region-info failures)
         const livekitTs = performance.now();
         agentLog.info({ sessionId: this.sessionId, type: 'voice' }, '[3/4] Connecting to LiveKit room...');
         const token = await this._generateToken();
         this._setupRoomEvents();
-        await this.room.connect(process.env.LIVEKIT_URL, token);
-        agentLog.info({ sessionId: this.sessionId, ms: Math.round(performance.now() - livekitTs), type: 'voice' }, '[3/4] LiveKit connected');
+        const maxRetries = 3;
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                await this.room.connect(process.env.LIVEKIT_URL, token);
+                agentLog.info({ sessionId: this.sessionId, ms: Math.round(performance.now() - livekitTs), attempt, type: 'voice' }, '[3/4] LiveKit connected');
+                break;
+            } catch (connectErr) {
+                agentLog.warn({ sessionId: this.sessionId, attempt, maxRetries, err: connectErr.message, type: 'voice' }, '[3/4] LiveKit connect failed');
+                if (attempt === maxRetries) throw connectErr;
+                const delay = 1000 * Math.pow(2, attempt - 1);
+                agentLog.info({ sessionId: this.sessionId, delayMs: delay, type: 'voice' }, `[3/4] Retrying in ${delay}ms...`);
+                await new Promise(r => setTimeout(r, delay));
+                this.room = new Room();
+                this._setupRoomEvents();
+            }
+        }
 
         // 4. Publish AI audio output track
         const trackTs = performance.now();
@@ -167,7 +191,7 @@ export class VoiceAgentWorker {
         });
 
         this.isActive = true;
-        agentLog.info({ sessionId: this.sessionId, ms: Math.round(performance.now() - trackTs), totalMs: Math.round(performance.now() - startTs), type: 'voice' }, '[4/4] VoiceAgent ready');
+        agentLog.info({ sessionId: this.sessionId, ms: Math.round(performance.now() - trackTs), totalMs: Math.round(performance.now() - startTs), type: 'voice' }, '[4/4] Conversational AI ready');
 
         // 5. Trigger opening greeting — small delay lets the LiveKit track settle
         setTimeout(() => {
@@ -236,6 +260,7 @@ export class VoiceAgentWorker {
 - When searching the PDF, summarize the findings naturally in speech rather than reading verbatim
 - Don't read out long lists — summarize the key points instead
 - If asked something you don't know, say so honestly and offer to search the document or web
+- If the user explicitly asks to "end the session", "stop", or "disconnect", use the end_session tool to terminate the interaction gracefully.
 - You can have casual conversation, answer general questions, or help the user understand their document
 - NEVER include internal reasoning, thought process headers, or meta-commentary like "Clarifying User Intent" or "Analyzing request" in your spoken response. Just speak naturally and directly to the user.`;
 
@@ -334,7 +359,7 @@ export class VoiceAgentWorker {
                 this._stopSpeaking();
                 if (this.io) {
                     this.io.to(this.sessionId).emit('voice_state', { state: 'listening' });
-      t           }
+                    }
             }
 
             // Audio output from model turn parts
@@ -415,6 +440,17 @@ export class VoiceAgentWorker {
                 } catch (err) {
                     responses.push({ id: fn.id, name: fn.name, response: { output: 'Failed to search the document.' } });
                 }
+            } else if (fn.name === 'end_session') {
+                agentLog.info({ sessionId: this.sessionId, type: 'voice' }, 'end_session tool called');
+                responses.push({ id: fn.id, name: fn.name, response: { output: 'Disconnecting now. Goodbye!' } });
+                
+                // Trigger graceful stop after a tiny delay to allow the response to be processed
+                setTimeout(() => {
+                    if (this.io) {
+                        this.io.to(this.sessionId).emit('voice_state', { state: 'disconnected' });
+                    }
+                    this.stop();
+                }, 1000);
             }
         }
 
@@ -447,7 +483,7 @@ export class VoiceAgentWorker {
 
     stop() {
         if (!this.isActive) return;
-        agentLog.info({ sessionId: this.sessionId, type: 'voice' }, 'VoiceAgent stopping');
+        agentLog.info({ sessionId: this.sessionId, type: 'voice' }, 'Conversational AI stopping');
         this.isActive = false;
         this._stopSpeaking();
         try { this.geminiSession?.close(); } catch (_) {}

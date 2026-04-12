@@ -61,7 +61,7 @@ export class VoicePipelineWorker {
         sessionId,
         io = null,
         identity = "voice-agent",
-        displayName = "Voice Agent",
+        displayName = "Conversational AI",
         sampleRate = 16000,
         bargeInMinWords = 3,
         bargeInThreshold = 400,
@@ -102,11 +102,27 @@ export class VoicePipelineWorker {
         agentLog.info({ sessionId: this.sessionId, ms: Math.round(performance.now() - tokenTs) }, '[2/4] LiveKit token ready');
         this.setupRoomEvents();
 
-        // 3. Connect to LiveKit Room
+        // 3. Connect to LiveKit Room (with retry for transient failures)
         const connectTs = performance.now();
         agentLog.info({ sessionId: this.sessionId }, '[3/4] Connecting to LiveKit room...');
-        await this.room.connect(process.env.LIVEKIT_URL, token);
-        agentLog.info({ sessionId: this.sessionId, ms: Math.round(performance.now() - connectTs) }, '[3/4] LiveKit room connected');
+        const maxRetries = 3;
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                await this.room.connect(process.env.LIVEKIT_URL, token);
+                agentLog.info({ sessionId: this.sessionId, ms: Math.round(performance.now() - connectTs), attempt }, '[3/4] LiveKit room connected');
+                break;
+            } catch (connectErr) {
+                agentLog.warn({ sessionId: this.sessionId, attempt, maxRetries, err: connectErr.message }, '[3/4] LiveKit connect failed');
+                if (attempt === maxRetries) throw connectErr;
+                // Exponential backoff: 1s, 2s, 4s
+                const delay = 1000 * Math.pow(2, attempt - 1);
+                agentLog.info({ sessionId: this.sessionId, delayMs: delay }, `[3/4] Retrying in ${delay}ms...`);
+                await new Promise(r => setTimeout(r, delay));
+                // Recreate room instance for fresh connection
+                this.room = new Room();
+                this.setupRoomEvents();
+            }
+        }
 
         // 4. Publish AI voice track
         const trackTs = performance.now();
