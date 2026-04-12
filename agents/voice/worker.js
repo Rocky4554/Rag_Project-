@@ -66,6 +66,8 @@ export class VoiceAgentWorker {
         this.audioPublisher = new AudioPublisher(OUTPUT_SAMPLE_RATE, 1);
         this.geminiSession = null;
         this.isActive = false;
+        this._audioQueue = [];
+        this._playingAudio = false;
     }
 
     async start() {
@@ -358,21 +360,14 @@ export class VoiceAgentWorker {
                 }
             }
 
-            // Audio output from model turn parts — push directly (no queue needed,
-            // Gemini sends small chunks serially so we process inline)
+            // Audio output from model turn parts
             if (msg.serverContent.modelTurn?.parts) {
                 for (const part of msg.serverContent.modelTurn.parts) {
                     if (part.inlineData?.mimeType?.startsWith('audio/')) {
                         const buf = Buffer.from(part.inlineData.data, 'base64');
-                        if (buf.length > 0) {
-                            // Ensure the buffer is aligned and separate from the original
-                            const alignedBuf = Buffer.alloc(buf.length);
-                            buf.copy(alignedBuf);
-                            const pcm = new Int16Array(alignedBuf.buffer, alignedBuf.byteOffset, alignedBuf.length / 2);
-                            
-                            // AudioPublisher handles its own internal queueing to prevent overlaps
-                            await this.audioPublisher.pushPCM(pcm);
-                        }
+                        const pcm = new Int16Array(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
+                        this._audioQueue.push(pcm);
+                        this._processAudioQueue();
                         if (this.io) {
                             this.io.to(this.sessionId).emit('voice_state', { state: 'speaking' });
                         }
@@ -386,7 +381,6 @@ export class VoiceAgentWorker {
             // Turn complete — signal AI is done speaking
             if (msg.serverContent.turnComplete) {
                 agentLog.debug({ sessionId: this.sessionId, type: 'voice' }, 'Gemini turn complete');
-                this.audioPublisher.finishPlayback();
                 if (this.io) {
                     this.io.to(this.sessionId).emit('voice_state', { state: 'listening' });
                 }
@@ -463,7 +457,25 @@ export class VoiceAgentWorker {
         }
     }
 
+    async _processAudioQueue() {
+        if (this._playingAudio) return;
+        this._playingAudio = true;
+        try {
+            while (this._audioQueue.length > 0) {
+                const chunk = this._audioQueue.shift();
+                if (chunk.length > 0) {
+                    await this.audioPublisher.pushPCM(chunk);
+                }
+            }
+        } catch (err) {
+            agentLog.error({ sessionId: this.sessionId, err: err.message, type: 'voice' }, 'Audio queue playback error');
+        } finally {
+            this._playingAudio = false;
+        }
+    }
+
     _stopSpeaking() {
+        this._audioQueue = [];
         this.audioPublisher.stop();
     }
 

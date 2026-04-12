@@ -11,54 +11,38 @@ export class AudioPublisher {
         this.source = new AudioSource(sampleRate, channels);
         this.isSpeaking = false;
         this.stopFlag = false;
-        this._totalChunksSent = 0;
-        this._playbackStartTime = 0;
-        this._queue = Promise.resolve();
-        this._residual = new Int16Array(0);
     }
 
     /**
      * Pushes a complete raw PCM (Int16) buffer to LiveKit in 10ms AudioFrame chunks.
-     * Queues calls internally to ensure sequential playback and prevent noise.
      * @param {Int16Array} pcmData - The raw PCM data to play
      */
     async pushPCM(pcmData) {
-        // Queue the playback task to ensure serial execution
-        this._queue = this._queue.then(() => this._internalPushPCM(pcmData));
-        return this._queue;
-    }
+        this.isSpeaking = true;
+        this.stopFlag = false;
+        agentLog.info({ samples: pcmData.length, sampleRate: this.sampleRate }, 'AudioPublisher playback start');
 
-    async _internalPushPCM(pcmData) {
-        if (!pcmData || (pcmData.length === 0 && this._residual.length === 0)) return;
+        const startTime = performance.now();
+        let chunksSent = 0;
 
-        const isFirstInSequence = !this.isSpeaking;
-        if (isFirstInSequence) {
-            this.isSpeaking = true;
-            this.stopFlag = false;
-            this._totalChunksSent = 0;
-            this._playbackStartTime = performance.now();
-            agentLog.info({ samples: pcmData.length, sampleRate: this.sampleRate }, 'AudioPublisher playback start');
-        }
+        for (let offset = 0; offset < pcmData.length; offset += this.samplesPerChunk) {
+            if (this.stopFlag) {
+                agentLog.debug('AudioPublisher playback interrupted');
+                break;
+            }
 
-        // Combine with residual samples from previous call
-        let dataToProcess;
-        if (this._residual.length > 0) {
-            dataToProcess = new Int16Array(this._residual.length + pcmData.length);
-            dataToProcess.set(this._residual);
-            dataToProcess.set(pcmData, this._residual.length);
-            this._residual = new Int16Array(0);
-        } else {
-            dataToProcess = pcmData;
-        }
+            let chunkData;
+            if (offset + this.samplesPerChunk <= pcmData.length) {
+                // MUST use .slice() not .subarray() — subarray shares the parent
+                // ArrayBuffer, and livekit-rtc-node's AudioFrame.protoInfo() reads
+                // from this.data.buffer (byte 0 of the underlying buffer).  With
+                // subarray every frame would contain the same first 160 samples.
+                chunkData = pcmData.slice(offset, offset + this.samplesPerChunk);
+            } else {
+                chunkData = new Int16Array(this.samplesPerChunk);
+                chunkData.set(pcmData.subarray(offset));
+            }
 
-        const totalLength = dataToProcess.length;
-        let offset = 0;
-
-        // Process all complete 10ms chunks
-        while (offset + this.samplesPerChunk <= totalLength) {
-            if (this.stopFlag) break;
-
-            const chunkData = dataToProcess.slice(offset, offset + this.samplesPerChunk);
             const frame = new AudioFrame(
                 chunkData,
                 this.sampleRate,
@@ -66,57 +50,27 @@ export class AudioPublisher {
                 this.samplesPerChunk
             );
 
-            try {
-                await this.source.captureFrame(frame);
-                this._totalChunksSent++;
+            await this.source.captureFrame(frame);
+            chunksSent++;
 
-                // Precise pacing
-                const nextChunkTime = this._playbackStartTime + (this._totalChunksSent * 10);
-                const now = performance.now();
-                const delay = nextChunkTime - now;
+            // Precise pacing: calculate when the next chunk SHOULD be sent
+            // and wait exactly that long, avoiding event loop drift
+            const nextChunkTime = startTime + (chunksSent * 10);
+            const now = performance.now();
+            const delay = nextChunkTime - now;
 
-                if (delay > 0) {
-                    await new Promise(resolve => setTimeout(resolve, delay));
-                }
-            } catch (err) {
-                agentLog.error({ err: err.message }, 'LiveKit captureFrame error');
-                break;
+            if (delay > 0) {
+                await new Promise(resolve => setTimeout(resolve, delay));
             }
-            offset += this.samplesPerChunk;
         }
 
-        // Store leftovers for next call
-        if (!this.stopFlag && offset < totalLength) {
-            this._residual = dataToProcess.slice(offset);
-        }
-    }
-
-    /** Mark playback as finished — called after turn completes or on interrupt. */
-    finishPlayback() {
-        // Flush any remaining residual as a padded chunk if it's significant
-        if (this._residual.length > 0 && !this.stopFlag) {
-            const padded = new Int16Array(this.samplesPerChunk);
-            padded.set(this._residual);
-            this.pushPCM(padded);
-            this._residual = new Int16Array(0);
-        }
-
-        this._queue.then(() => {
-            if (this.isSpeaking) {
-                const playbackMs = Math.round(performance.now() - this._playbackStartTime);
-                agentLog.info({ chunksSent: this._totalChunksSent, playbackMs }, 'AudioPublisher playback complete');
-            }
-            this.isSpeaking = false;
-        });
+        const playbackMs = Math.round(performance.now() - startTime);
+        agentLog.info({ chunksSent, playbackMs }, 'AudioPublisher playback complete');
+        this.isSpeaking = false;
     }
 
     stop() {
         this.stopFlag = true;
-        this._residual = new Int16Array(0);
-        if (this.isSpeaking) {
-            const playbackMs = Math.round(performance.now() - this._playbackStartTime);
-            agentLog.info({ chunksSent: this._totalChunksSent, playbackMs }, 'AudioPublisher playback interrupted');
-        }
         this.isSpeaking = false;
     }
 }
