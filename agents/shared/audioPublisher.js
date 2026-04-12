@@ -11,25 +11,27 @@ export class AudioPublisher {
         this.source = new AudioSource(sampleRate, channels);
         this.isSpeaking = false;
         this.stopFlag = false;
+        this._totalChunksSent = 0;
+        this._playbackStartTime = 0;
     }
 
     /**
      * Pushes a complete raw PCM (Int16) buffer to LiveKit in 10ms AudioFrame chunks.
+     * Optimized: minimal logging per-call, batch metrics only on first/last chunk.
      * @param {Int16Array} pcmData - The raw PCM data to play
      */
     async pushPCM(pcmData) {
-        this.isSpeaking = true;
-        this.stopFlag = false;
-        agentLog.info({ samples: pcmData.length, sampleRate: this.sampleRate }, 'AudioPublisher playback start');
-
-        const startTime = performance.now();
-        let chunksSent = 0;
+        const isFirstChunk = !this.isSpeaking;
+        if (isFirstChunk) {
+            this.isSpeaking = true;
+            this.stopFlag = false;
+            this._totalChunksSent = 0;
+            this._playbackStartTime = performance.now();
+            agentLog.info({ samples: pcmData.length, sampleRate: this.sampleRate }, 'AudioPublisher playback start');
+        }
 
         for (let offset = 0; offset < pcmData.length; offset += this.samplesPerChunk) {
-            if (this.stopFlag) {
-                agentLog.debug('AudioPublisher playback interrupted');
-                break;
-            }
+            if (this.stopFlag) break;
 
             let chunkData;
             if (offset + this.samplesPerChunk <= pcmData.length) {
@@ -51,11 +53,11 @@ export class AudioPublisher {
             );
 
             await this.source.captureFrame(frame);
-            chunksSent++;
+            this._totalChunksSent++;
 
             // Precise pacing: calculate when the next chunk SHOULD be sent
             // and wait exactly that long, avoiding event loop drift
-            const nextChunkTime = startTime + (chunksSent * 10);
+            const nextChunkTime = this._playbackStartTime + (this._totalChunksSent * 10);
             const now = performance.now();
             const delay = nextChunkTime - now;
 
@@ -63,14 +65,23 @@ export class AudioPublisher {
                 await new Promise(resolve => setTimeout(resolve, delay));
             }
         }
+    }
 
-        const playbackMs = Math.round(performance.now() - startTime);
-        agentLog.info({ chunksSent, playbackMs }, 'AudioPublisher playback complete');
+    /** Mark playback as finished — called after turn completes or on interrupt. */
+    finishPlayback() {
+        if (this.isSpeaking) {
+            const playbackMs = Math.round(performance.now() - this._playbackStartTime);
+            agentLog.info({ chunksSent: this._totalChunksSent, playbackMs }, 'AudioPublisher playback complete');
+        }
         this.isSpeaking = false;
     }
 
     stop() {
         this.stopFlag = true;
+        if (this.isSpeaking) {
+            const playbackMs = Math.round(performance.now() - this._playbackStartTime);
+            agentLog.info({ chunksSent: this._totalChunksSent, playbackMs }, 'AudioPublisher playback interrupted');
+        }
         this.isSpeaking = false;
     }
 }

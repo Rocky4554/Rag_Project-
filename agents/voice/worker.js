@@ -66,10 +66,6 @@ export class VoiceAgentWorker {
         this.audioPublisher = new AudioPublisher(OUTPUT_SAMPLE_RATE, 1);
         this.geminiSession = null;
         this.isActive = false;
-
-        // Progressive audio playback queue
-        this._audioQueue = [];
-        this._playingAudio = false;
     }
 
     async start() {
@@ -88,7 +84,7 @@ export class VoiceAgentWorker {
         const systemPrompt = await this._buildSystemPrompt();
         agentLog.info({ sessionId: this.sessionId, ms: Math.round(performance.now() - promptTs), chars: systemPrompt.length, type: 'voice' }, '[1/4] System prompt ready');
 
-        // 2. Open Gemini Live WebSocket
+        // 2. Open Gemini Live WebSocket + LiveKit in parallel
         const geminiTs = performance.now();
         agentLog.info({ sessionId: this.sessionId, model: VOICE_MODEL, apiVersion: LIVE_API_VERSION, type: 'voice' }, '[2/4] Connecting to Gemini Live...');
         const self = this;
@@ -159,7 +155,7 @@ export class VoiceAgentWorker {
             }
         });
 
-        // 3. Connect to LiveKit room (with retry for transient region-info failures)
+        // 3. Connect to LiveKit room (in parallel with Gemini connection above)
         const livekitTs = performance.now();
         agentLog.info({ sessionId: this.sessionId, type: 'voice' }, '[3/4] Connecting to LiveKit room...');
         const token = await this._generateToken();
@@ -193,18 +189,18 @@ export class VoiceAgentWorker {
         this.isActive = true;
         agentLog.info({ sessionId: this.sessionId, ms: Math.round(performance.now() - trackTs), totalMs: Math.round(performance.now() - startTs), type: 'voice' }, '[4/4] Conversational AI ready');
 
-        // 5. Trigger opening greeting — small delay lets the LiveKit track settle
+        // 5. Trigger opening greeting — minimal delay for track to settle
         setTimeout(() => {
             if (this.isActive && this.geminiSession) {
                 const greetMsg = this.userName
-                    ? `The user just joined. Greet them now — say "Hello ${this.userName}!" and briefly mention you're ready to help.`
-                    : `The user just joined. Greet them now and briefly mention you're ready to help.`;
+                    ? `The user just joined. Greet them briefly — say "Hello ${this.userName}!" and mention you're ready to help. Keep it very short, 1-2 sentences max.`
+                    : `The user just joined. Greet them briefly — say "Hello!" and mention you're ready to help. Keep it very short, 1-2 sentences max.`;
                 this.geminiSession.sendClientContent({
                     turns: [{ role: 'user', parts: [{ text: greetMsg }] }],
                     turnComplete: true
                 });
             }
-        }, 1000);
+        }, 300);
     }
 
     async _buildSystemPrompt() {
@@ -216,8 +212,8 @@ export class VoiceAgentWorker {
         let docContext = '';
         if (session?.vectorStore) {
             try {
-                const docs = await session.vectorStore.similaritySearch('introduction summary overview', 5);
-                docContext = docs.map(d => d.pageContent).join('\n\n').substring(0, 1500);
+                const docs = await session.vectorStore.similaritySearch('introduction summary overview', 3);
+                docContext = docs.map(d => d.pageContent).join('\n\n').substring(0, 800);
             } catch (err) {
                 agentLog.warn({ err: err.message, type: 'voice' }, 'Failed to fetch doc context for voice agent');
             }
@@ -234,7 +230,7 @@ export class VoiceAgentWorker {
             }
         }
 
-        let prompt = `You are a helpful, friendly AI voice assistant. Speak naturally, clearly, and conversationally.`;
+        let prompt = `You are a helpful, friendly AI voice assistant. Be brief and direct. Speak naturally and conversationally. Answer in 1-3 short sentences unless the user asks for more detail.`;
 
         if (name !== 'there') {
             prompt += ` The user's name is ${name}. Greet them by name when the conversation starts.`;
@@ -359,17 +355,20 @@ export class VoiceAgentWorker {
                 this._stopSpeaking();
                 if (this.io) {
                     this.io.to(this.sessionId).emit('voice_state', { state: 'listening' });
-                    }
+                }
             }
 
-            // Audio output from model turn parts
+            // Audio output from model turn parts — push directly (no queue needed,
+            // Gemini sends small chunks serially so we process inline)
             if (msg.serverContent.modelTurn?.parts) {
                 for (const part of msg.serverContent.modelTurn.parts) {
                     if (part.inlineData?.mimeType?.startsWith('audio/')) {
                         const buf = Buffer.from(part.inlineData.data, 'base64');
                         const pcm = new Int16Array(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
-                        this._audioQueue.push(pcm);
-                        this._processAudioQueue();
+                        // Fire-and-forget push — AudioPublisher handles pacing internally
+                        this.audioPublisher.pushPCM(pcm).catch(err => {
+                            agentLog.error({ sessionId: this.sessionId, err: err.message, type: 'voice' }, 'Audio push error');
+                        });
                         if (this.io) {
                             this.io.to(this.sessionId).emit('voice_state', { state: 'speaking' });
                         }
@@ -383,6 +382,7 @@ export class VoiceAgentWorker {
             // Turn complete — signal AI is done speaking
             if (msg.serverContent.turnComplete) {
                 agentLog.debug({ sessionId: this.sessionId, type: 'voice' }, 'Gemini turn complete');
+                this.audioPublisher.finishPlayback();
                 if (this.io) {
                     this.io.to(this.sessionId).emit('voice_state', { state: 'listening' });
                 }
@@ -459,25 +459,7 @@ export class VoiceAgentWorker {
         }
     }
 
-    async _processAudioQueue() {
-        if (this._playingAudio) return;
-        this._playingAudio = true;
-        try {
-            while (this._audioQueue.length > 0) {
-                const chunk = this._audioQueue.shift();
-                if (chunk.length > 0) {
-                    await this.audioPublisher.pushPCM(chunk);
-                }
-            }
-        } catch (err) {
-            agentLog.error({ sessionId: this.sessionId, err: err.message, type: 'voice' }, 'Audio queue playback error');
-        } finally {
-            this._playingAudio = false;
-        }
-    }
-
     _stopSpeaking() {
-        this._audioQueue = [];
         this.audioPublisher.stop();
     }
 
