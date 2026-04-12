@@ -25,9 +25,11 @@ const PHRASE_TEXT = {
     "interview_outro":   "That concludes our interview.",
     "interview_stopped": "The interview has been stopped.",
     "out_of_context":    "Let's stay on topic.",
+    "youre_welcome":     "You're welcome!",
+    "take_a_break":      "Of course, take your time.",
 };
 
-const FEEDBACK_ONLY_INTENTS = ['confused', 'meta', 'irrelevant'];
+const FEEDBACK_ONLY_INTENTS = ['confused', 'meta', 'irrelevant', 'break_request', 'hint_request', 'gratitude', 'greeting'];
 const THINKING_INTENTS = ['thinking_out_loud'];
 const CUTOFF_INTENTS = ['premature_cutoff'];
 
@@ -68,6 +70,28 @@ export class InterviewAgentWorker extends VoicePipelineWorker {
                     await this._speakAndEmit(this.currentQuestion);
                 },
             };
+        }
+
+        // ── Fast-path: auto-hint offer when struggling (struggleStreak ≥ 2 + skip) ──
+        // Re-route "I don't know" to hint_request for struggling candidates
+        if (/\b(dont know|no idea|not sure|cant answer|i dont know)\b/.test(lowerAns)) {
+            const session = this.sessionCache[this.sessionId];
+            const interviewState = session?.interviewStateConfig;
+            // Check the checkpoint for struggleStreak (if available)
+            if (interviewState) {
+                try {
+                    const snap = await this.sessionBridge.agentWorkflow.getState(interviewState);
+                    if (snap?.values?.struggleStreak >= 2 && (snap?.values?.hintsGiven || 0) < 2) {
+                        agentLog.info({ sessionId: this.sessionId, struggleStreak: snap.values.struggleStreak }, 'Auto-offering hint for struggling candidate');
+                        // Offer a hint instead of just skipping
+                        return {
+                            segments: [{ text: "I can see this one's tricky. Would you like me to give you a hint? Just say 'yes' or 'give me a hint', or say 'skip' to move on." }],
+                        };
+                    }
+                } catch {
+                    // Checkpoint read failed — continue to normal flow
+                }
+            }
         }
 
         // ── Process via LangGraph ───────────────────────────────
