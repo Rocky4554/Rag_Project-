@@ -364,11 +364,15 @@ export class VoiceAgentWorker {
                 for (const part of msg.serverContent.modelTurn.parts) {
                     if (part.inlineData?.mimeType?.startsWith('audio/')) {
                         const buf = Buffer.from(part.inlineData.data, 'base64');
-                        const pcm = new Int16Array(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
-                        // Fire-and-forget push — AudioPublisher handles pacing internally
-                        this.audioPublisher.pushPCM(pcm).catch(err => {
-                            agentLog.error({ sessionId: this.sessionId, err: err.message, type: 'voice' }, 'Audio push error');
-                        });
+                        if (buf.length > 0) {
+                            // Ensure the buffer is aligned and separate from the original
+                            const alignedBuf = Buffer.alloc(buf.length);
+                            buf.copy(alignedBuf);
+                            const pcm = new Int16Array(alignedBuf.buffer, alignedBuf.byteOffset, alignedBuf.length / 2);
+                            
+                            // AudioPublisher handles its own internal queueing to prevent overlaps
+                            await this.audioPublisher.pushPCM(pcm);
+                        }
                         if (this.io) {
                             this.io.to(this.sessionId).emit('voice_state', { state: 'speaking' });
                         }

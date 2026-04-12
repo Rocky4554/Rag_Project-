@@ -14,6 +14,7 @@ export class AudioPublisher {
         this._totalChunksSent = 0;
         this._playbackStartTime = 0;
         this._queue = Promise.resolve();
+        this._residual = new Int16Array(0);
     }
 
     /**
@@ -28,7 +29,7 @@ export class AudioPublisher {
     }
 
     async _internalPushPCM(pcmData) {
-        if (!pcmData || pcmData.length === 0) return;
+        if (!pcmData || (pcmData.length === 0 && this._residual.length === 0)) return;
 
         const isFirstInSequence = !this.isSpeaking;
         if (isFirstInSequence) {
@@ -39,19 +40,25 @@ export class AudioPublisher {
             agentLog.info({ samples: pcmData.length, sampleRate: this.sampleRate }, 'AudioPublisher playback start');
         }
 
-        for (let offset = 0; offset < pcmData.length; offset += this.samplesPerChunk) {
+        // Combine with residual samples from previous call
+        let dataToProcess;
+        if (this._residual.length > 0) {
+            dataToProcess = new Int16Array(this._residual.length + pcmData.length);
+            dataToProcess.set(this._residual);
+            dataToProcess.set(pcmData, this._residual.length);
+            this._residual = new Int16Array(0);
+        } else {
+            dataToProcess = pcmData;
+        }
+
+        const totalLength = dataToProcess.length;
+        let offset = 0;
+
+        // Process all complete 10ms chunks
+        while (offset + this.samplesPerChunk <= totalLength) {
             if (this.stopFlag) break;
 
-            let chunkData;
-            if (offset + this.samplesPerChunk <= pcmData.length) {
-                // MUST use .slice() not .subarray() — subarray shares the parent
-                // ArrayBuffer, and livekit-rtc-node's AudioFrame readings from this.data.buffer.
-                chunkData = pcmData.slice(offset, offset + this.samplesPerChunk);
-            } else {
-                chunkData = new Int16Array(this.samplesPerChunk);
-                chunkData.set(pcmData.subarray(offset));
-            }
-
+            const chunkData = dataToProcess.slice(offset, offset + this.samplesPerChunk);
             const frame = new AudioFrame(
                 chunkData,
                 this.sampleRate,
@@ -63,7 +70,7 @@ export class AudioPublisher {
                 await this.source.captureFrame(frame);
                 this._totalChunksSent++;
 
-                // Precise pacing: calculate when the next chunk SHOULD be sent
+                // Precise pacing
                 const nextChunkTime = this._playbackStartTime + (this._totalChunksSent * 10);
                 const now = performance.now();
                 const delay = nextChunkTime - now;
@@ -75,20 +82,37 @@ export class AudioPublisher {
                 agentLog.error({ err: err.message }, 'LiveKit captureFrame error');
                 break;
             }
+            offset += this.samplesPerChunk;
+        }
+
+        // Store leftovers for next call
+        if (!this.stopFlag && offset < totalLength) {
+            this._residual = dataToProcess.slice(offset);
         }
     }
 
     /** Mark playback as finished — called after turn completes or on interrupt. */
     finishPlayback() {
-        if (this.isSpeaking) {
-            const playbackMs = Math.round(performance.now() - this._playbackStartTime);
-            agentLog.info({ chunksSent: this._totalChunksSent, playbackMs }, 'AudioPublisher playback complete');
+        // Flush any remaining residual as a padded chunk if it's significant
+        if (this._residual.length > 0 && !this.stopFlag) {
+            const padded = new Int16Array(this.samplesPerChunk);
+            padded.set(this._residual);
+            this.pushPCM(padded);
+            this._residual = new Int16Array(0);
         }
-        this.isSpeaking = false;
+
+        this._queue.then(() => {
+            if (this.isSpeaking) {
+                const playbackMs = Math.round(performance.now() - this._playbackStartTime);
+                agentLog.info({ chunksSent: this._totalChunksSent, playbackMs }, 'AudioPublisher playback complete');
+            }
+            this.isSpeaking = false;
+        });
     }
 
     stop() {
         this.stopFlag = true;
+        this._residual = new Int16Array(0);
         if (this.isSpeaking) {
             const playbackMs = Math.round(performance.now() - this._playbackStartTime);
             agentLog.info({ chunksSent: this._totalChunksSent, playbackMs }, 'AudioPublisher playback interrupted');
