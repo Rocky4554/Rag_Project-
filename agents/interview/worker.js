@@ -185,17 +185,16 @@ export class InterviewAgentWorker extends VoicePipelineWorker {
         }
 
         // ── Normal answer — feedback + next question ────────────
-        const parsedFeedback = parseTTSResponse(result.evaluation?.feedback || "");
+        // Feedback: use as-is (Gemini backchannel already prepended in interviewAgent.js)
+        // No cached phrase — single natural TTS chunk, no awkward pause
+        const feedbackText = parseTTSResponse(result.evaluation?.feedback || "").uniquePart;
+
+        // Question: still parse for [next_question]/[final_question] cache tags
         const parsedQuestion = parseTTSResponse(result.nextQuestion || "");
-
-        const feedbackPhrases = (parsedFeedback.phraseKeys || []).map(k => PHRASE_TEXT[k] || "").join(" ");
         const questionPhrases = (parsedQuestion.phraseKeys || []).map(k => PHRASE_TEXT[k] || "").join(" ");
-
-        for (const k of (parsedFeedback.phraseKeys || [])) {
+        for (const k of (parsedQuestion.phraseKeys || [])) {
             if (PHRASE_TEXT[k]) agentLog.info({ sessionId: this.sessionId, tag: k }, 'TTS phrase cache hit');
         }
-
-        const feedbackText = `${feedbackPhrases} ${parsedFeedback.uniquePart}`.trim();
         const questionText = `${questionPhrases} ${parsedQuestion.uniquePart}`.trim();
 
         if (questionText) this.currentQuestion = questionText;

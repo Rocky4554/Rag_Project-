@@ -63,8 +63,8 @@ export class VoicePipelineWorker {
         identity = "voice-agent",
         displayName = "Conversational AI",
         sampleRate = 16000,
-        bargeInMinWords = 3,
-        bargeInThreshold = 400,
+        bargeInMinWords = 2,
+        bargeInThreshold = 200,
         safetyTimeoutMs = 30000,
     }) {
         this.sessionId = sessionId;
@@ -212,9 +212,9 @@ export class VoicePipelineWorker {
                         if (!this.processingTurn && !this.audioPublisher.isSpeaking) {
                             this.stt.pushAudio(frame.data);
                         } else if (this.audioPublisher.isSpeaking) {
-                            if (hasSignificantAudio(frame.data, this.bargeInThreshold)) {
-                                this.stt.pushAudio(frame.data);
-                            }
+                            // Push ALL audio during AI speech so STT catches fast interruptions
+                            // Previously gated by amplitude (400) — missed soft/quick barge-ins
+                            this.stt.pushAudio(frame.data);
                         }
                     }
                 }
