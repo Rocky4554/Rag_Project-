@@ -19,7 +19,7 @@ export function createInterviewRoutes({ sessionCache, activeAgents, activeVoiceA
             // Try in-memory first, then auto-restore from DB+Qdrant
             const session = await ensureSession(sessionCache, sessionId);
             if (!session || !session.vectorStore) {
-                return res.status(404).json({ error: 'Session not found. Please upload a PDF or text document first.' });
+                return res.status(404).json({ error: 'Please upload a PDF or text document first.' });
             }
             if (session.contentType === 'image') {
                 return res.status(400).json({ error: 'Interview is not available for image uploads. Please upload a PDF or text document.' });
@@ -120,21 +120,19 @@ export function createInterviewRoutes({ sessionCache, activeAgents, activeVoiceA
                 }
             };
 
-            // Start agent connection in background — don't block HTTP response on LiveKit
-            // LiveKit room.connect() can fail transiently (region info fetch, DNS, etc.)
-            // and should NOT cause the whole interview to 500.
-            agent.start().catch(err => {
-                interviewLog.error({ err: err.message, sessionId }, 'Agent LiveKit connection failed (background)');
-                // Retry once after a short delay
+            // Optimize: parallelize agent.start() and LangGraph invoke
+            // Both run concurrently — agent connects to LiveKit while LangGraph generates first question
+            const agentStartPromise = agent.start().catch(err => {
+                interviewLog.error({ err: err.message, sessionId }, 'Agent LiveKit connection failed');
+                // Retry once after 2s
                 setTimeout(() => {
                     interviewLog.info({ sessionId }, 'Retrying agent LiveKit connection...');
                     agent.start().catch(err2 => {
-                        interviewLog.error({ err: err2.message, sessionId }, 'Agent LiveKit retry also failed');
+                        interviewLog.error({ err: err2.message, sessionId }, 'Agent LiveKit retry failed');
                     });
                 }, 2000);
             });
 
-            // Only await the LangGraph invoke — this is what the HTTP response needs
             const resultState = await interviewAgent.invoke(initialState, config);
 
             session.interviewStateConfig = config;
@@ -148,27 +146,27 @@ export function createInterviewRoutes({ sessionCache, activeAgents, activeVoiceA
                 });
             }
 
-            // Agent is already connected — speak first question immediately
             const { uniquePart } = parseTTSResponse(resultState.currentQuestion);
 
-            // Wait for client audio ready (reduced from 10s to 2s)
-            interviewLog.info({ sessionId }, 'Waiting for client audio ready');
-            await new Promise((resolve) => {
-                clientReadyResolvers.set(sessionId, resolve);
-                setTimeout(() => {
-                    if (clientReadyResolvers.has(sessionId)) {
-                        interviewLog.warn({ sessionId }, 'client_audio_ready timeout — speaking anyway');
-                        clientReadyResolvers.delete(sessionId);
+            // Ensure agent connected before speaking (wait for agent.start + client ready, max 3s total)
+            interviewLog.info({ sessionId }, 'Waiting for agent ready + client audio ready');
+            await Promise.all([
+                Promise.race([agentStartPromise, new Promise(r => setTimeout(r, 3000))]),
+                new Promise((resolve) => {
+                    clientReadyResolvers.set(sessionId, resolve);
+                    setTimeout(() => {
+                        if (clientReadyResolvers.has(sessionId)) {
+                            interviewLog.warn({ sessionId }, 'client_audio_ready timeout');
+                            clientReadyResolvers.delete(sessionId);
+                        }
                         resolve();
-                    }
-                }, 2000);
-            });
+                    }, 2000);
+                })
+            ]);
 
             interviewLog.info({ sessionId }, 'Speaking first question');
-            // Fire-and-forget — don't block the response
-            // speakIntro plays the personalised intro (with candidate name) then the first question.
             agent.speakIntro(uniquePart).catch(err => {
-                interviewLog.error({ err: err.message, sessionId }, 'Agent speakIntro error');
+                interviewLog.error({ err: err.message, sessionId }, 'speakIntro error');
             });
 
             res.json({
