@@ -63,8 +63,8 @@ export class VoicePipelineWorker {
         identity = "voice-agent",
         displayName = "Conversational AI",
         sampleRate = 16000,
-        bargeInMinWords = 2,
-        bargeInThreshold = 200,
+        bargeInMinWords = 3,
+        bargeInThreshold = 400,
         safetyTimeoutMs = 30000,
     }) {
         this.sessionId = sessionId;
@@ -83,6 +83,18 @@ export class VoicePipelineWorker {
         this.isActive = false;
         this.processingTurn = false;
         this.aiStoppedSpeakingAt = 0;
+
+        // Incremented on every barge-in. Each _speakAndEmit captures the epoch
+        // at start and bails the moment it changes — so an interrupt cancels the
+        // WHOLE remaining response, not just the single PCM chunk in flight.
+        this._speechEpoch = 0;
+    }
+
+    /** Cancel all in-flight TTS playback. Bumps the epoch so any running
+     *  _speakAndEmit loop breaks, and halts the current audio chunk. */
+    _interruptSpeech() {
+        this._speechEpoch++;
+        this.audioPublisher.stop();
     }
 
     // ── Lifecycle ───────────────────────────────────────────────
@@ -176,6 +188,20 @@ export class VoicePipelineWorker {
             this.stop();
         });
 
+        // VAD instant barge-in — OFF by default. The raw VAD event fires on ANY
+        // sound (the AI's own echo, background noise, a cough) and would cut the
+        // agent off mid-sentence. Only safe with reliable echo cancellation
+        // (headphones / client AEC). The transcript-confirmed barge-in below is
+        // the robust default: it only fires on actual transcribed words.
+        // Opt in with VAD_INSTANT_BARGE_IN=true once echo is under control.
+        this.stt.on("speechStarted", () => {
+            if (process.env.VAD_INSTANT_BARGE_IN === 'true' && this.audioPublisher.isSpeaking) {
+                agentLog.info({ sessionId: this.sessionId }, 'VAD speechStarted — instant barge-in, stopping TTS');
+                this._interruptSpeech();
+                this.aiStoppedSpeakingAt = Date.now();
+            }
+        });
+
         // STT transcript handler with barge-in support
         this.stt.on("transcript", async ({ transcript: text, utteranceDurationMs, fillerWordCount }) => {
             if (!this.isActive) return;
@@ -185,7 +211,7 @@ export class VoicePipelineWorker {
                 const wordCount = text.trim().split(/\s+/).filter(w => w).length;
                 if (wordCount >= this.bargeInMinWords) {
                     agentLog.info({ sessionId: this.sessionId, transcript: text.substring(0, 80), wordCount }, 'Barge-in detected');
-                    this.audioPublisher.stop();
+                    this._interruptSpeech();
                     await new Promise(r => setTimeout(r, 120));
 
                     const timeToAnswer = this.aiStoppedSpeakingAt > 0 ? Date.now() - this.aiStoppedSpeakingAt : 0;
@@ -212,9 +238,13 @@ export class VoicePipelineWorker {
                         if (!this.processingTurn && !this.audioPublisher.isSpeaking) {
                             this.stt.pushAudio(frame.data);
                         } else if (this.audioPublisher.isSpeaking) {
-                            // Push ALL audio during AI speech so STT catches fast interruptions
-                            // Previously gated by amplitude (400) — missed soft/quick barge-ins
-                            this.stt.pushAudio(frame.data);
+                            // During AI speech, only forward audio loud enough to be real
+                            // user speech. This gates out the AI's own voice echoing back
+                            // through the mic (which would otherwise trip VAD speechStarted
+                            // and falsely barge-in on every utterance). Tune via bargeInThreshold.
+                            if (hasSignificantAudio(frame.data, this.bargeInThreshold)) {
+                                this.stt.pushAudio(frame.data);
+                            }
                         }
                     }
                 }
@@ -331,9 +361,12 @@ export class VoicePipelineWorker {
 
     // ── Audio playback ──────────────────────────────────────────
 
-    /** Push raw PCM to LiveKit and record when AI finished speaking. */
-    async _playAudio(pcm) {
+    /** Push raw PCM to LiveKit and record when AI finished speaking.
+     *  Skips playback if the speech epoch advanced (barge-in) since the
+     *  caller started — prevents a queued chunk from resurrecting after stop(). */
+    async _playAudio(pcm, epoch) {
         if (!pcm) return;
+        if (epoch !== undefined && epoch !== this._speechEpoch) return;
         await this.audioPublisher.pushPCM(pcm);
         this.aiStoppedSpeakingAt = Date.now();
     }
@@ -344,10 +377,14 @@ export class VoicePipelineWorker {
      */
     async _speakAndEmit(text, emitStart = true, emitEnd = true) {
         if (!text) return;
+        // Capture the epoch at the start. A barge-in bumps this._speechEpoch,
+        // and every loop iteration below bails the instant it no longer matches.
+        const myEpoch = this._speechEpoch;
         if (emitStart) this._emitToRoom('ai_speech', { action: 'start' });
 
         const provider = (process.env.INTERVIEW_TTS_PROVIDER || "polly").toLowerCase();
 
+        // Speech marks for full text (subtitles)
         const marksPromise = provider === "deepgram"
             ? Promise.resolve(estimateWordTimings(text))
             : getSpeechMarks(text).catch(() => estimateWordTimings(text));
@@ -355,7 +392,12 @@ export class VoicePipelineWorker {
         let textEmitted = false;
         let firstChunk = true;
 
+        // Stream the FULL text in one TTS request — the provider streams chunks
+        // continuously, which is smooth. Splitting per-sentence would add the
+        // provider's first-chunk latency (~900ms) as a gap between sentences.
         for await (const { pcm, text: chunkText } of generatePCMPipelined(text, String(this.sampleRate))) {
+            if (this._speechEpoch !== myEpoch) break;
+
             if (chunkText && !textEmitted) {
                 this._emitToRoom('ai_speech', { action: 'sentence', text: chunkText });
                 textEmitted = true;
@@ -371,7 +413,7 @@ export class VoicePipelineWorker {
                 }
             }
 
-            await this._playAudio(pcm);
+            await this._playAudio(pcm, myEpoch);
         }
 
         if (emitEnd) this._emitToRoom('ai_speech', { action: 'end' });

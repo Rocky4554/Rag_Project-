@@ -5,6 +5,7 @@ import { optionalAuth } from "../middleware/auth.js";
 import { getDocumentBySessionId, saveInterviewResult, logActivity } from "../lib/db.js";
 import { ensureSession } from "../lib/sessionRestore.js";
 import { updateUserProfileAfterInterview, getUserProfileContext } from "../lib/interview/profileUpdater.js";
+import { generateGreeting, generateSimpleGreeting } from "../lib/interview/greetingGenerator.js";
 import { validate, interviewStartSchema } from '../lib/validation.js';
 import { interviewLog } from '../lib/logger.js';
 import { cleanupSessionAgents } from './conversationalAI.js';
@@ -14,7 +15,7 @@ export function createInterviewRoutes({ sessionCache, activeAgents, activeVoiceA
 
     router.post('/interview/start', validate(interviewStartSchema), optionalAuth, async (req, res) => {
         try {
-            const { sessionId, maxQuestions = 5 } = req.validated;
+            const { sessionId, maxQuestions = 5, timezone } = req.validated;
 
             // Try in-memory first, then auto-restore from DB+Qdrant
             const session = await ensureSession(sessionCache, sessionId);
@@ -57,8 +58,19 @@ export function createInterviewRoutes({ sessionCache, activeAgents, activeVoiceA
                 }
             }
 
-            const h = new Date().getHours();
-            const timeGreeting = h < 12 ? 'Good morning' : h < 17 ? 'Good afternoon' : 'Good evening';
+            // Generate personalized greeting based on timezone, mood, difficulty
+            let greetingData;
+            try {
+                greetingData = generateGreeting(
+                    req.user?.name || "there",
+                    timezone || 'UTC',
+                    userProfileContext,
+                    "medium"
+                );
+            } catch (err) {
+                interviewLog.warn({ err: err.message }, 'Greeting generation failed, using fallback');
+                greetingData = generateSimpleGreeting(req.user?.name || "there", "medium");
+            }
 
             const initialState = {
                 sessionId,
@@ -69,7 +81,8 @@ export function createInterviewRoutes({ sessionCache, activeAgents, activeVoiceA
                 topicsUsed: [],
                 userProfileContext,
                 candidateName: req.user?.name || "there",
-                timeGreeting,
+                timeGreeting: greetingData.timeGreeting,
+                greetingMessage: greetingData.greeting, // Full personalized greeting
             };
 
             // Use a unique thread_id per interview run so the PostgresSaver checkpointer

@@ -6,6 +6,7 @@ import { SessionBridge } from "./sessionBridge.js";
 import { parseTTSResponse, checkTTSCache } from "../../lib/interview/interviewAgent.js";
 import { mp3ToPCM } from "./mp3ToPCM.js";
 import { agentLog } from "../../lib/logger.js";
+import { cleanTranscript, checkSemanticCompleteness } from "./transcriptCleaner.js";
 
 dotenv.config();
 
@@ -61,6 +62,20 @@ export class InterviewAgentWorker extends VoicePipelineWorker {
     // ── Core: handle each user turn ─────────────────────────────
 
     async onUserTranscript(transcript, acousticMeta) {
+        // Tier 1: rule-based cleanup (sync, zero cost) — strip fillers, fix repeats, capitalize
+        transcript = cleanTranscript(transcript);
+
+        // Tier 2: semantic completeness check (async, Gemini Flash) — only for short ambiguous transcripts
+        // This catches cut-offs that slipped past the STT-layer _looksIncomplete heuristic.
+        const wordCount = transcript.trim().split(/\s+/).filter(Boolean).length;
+        if (wordCount < 8 && !/[.?!]$/.test(transcript.trim())) {
+            const isComplete = await checkSemanticCompleteness(transcript);
+            if (!isComplete) {
+                agentLog.info({ sessionId: this.sessionId, snippet: transcript }, 'Semantic guard: transcript incomplete, waiting silently');
+                return { silent: true };
+            }
+        }
+
         // ── Fast-path: pardon / repeat request ──────────────────
         const lowerAns = transcript.trim().toLowerCase().replace(/[^a-z\s]/g, "").trim();
         if (this.currentQuestion && /\b(pardon|repeat|say again|say that again|can you repeat|what was the question|come again|once more)\b/.test(lowerAns)) {

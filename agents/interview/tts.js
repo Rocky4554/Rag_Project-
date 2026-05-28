@@ -195,16 +195,15 @@ async function deepgramGeneratePCM(text, sampleRate = "16000") {
     try {
         ttsLog.info({ provider: "deepgram", textLen: text.length, model }, "TTS request");
         const dg = getDeepgramTTSClient();
-        const response = await dg.speak.request(
-            { text },
-            {
-                model,
-                encoding: "linear16",
-                sample_rate: parseInt(sampleRate),
-                container: "none",
-            }
-        );
-        const stream = await response.getStream();
+        // SDK v5: dg.speak.v1.audio.generate(), .stream() is synchronous
+        const response = await dg.speak.v1.audio.generate({
+            text,
+            model,
+            encoding: "linear16",
+            sample_rate: parseInt(sampleRate),
+            container: "none",
+        });
+        const stream = response.stream();
         if (!stream) {
             ttsLog.error({ provider: "deepgram" }, "TTS returned no stream");
             return null;
@@ -234,16 +233,15 @@ async function* deepgramGeneratePCMPipelined(text, sampleRate = "16000") {
     try {
         ttsLog.info({ provider: "deepgram", textLen: text.length, model, streaming: true }, "TTS stream start");
         const dg = getDeepgramTTSClient();
-        const response = await dg.speak.request(
-            { text },
-            {
-                model,
-                encoding: "linear16",
-                sample_rate: parseInt(sampleRate),
-                container: "none",
-            }
-        );
-        const stream = await response.getStream();
+        // SDK v5: dg.speak.v1.audio.generate(), .stream() is synchronous
+        const response = await dg.speak.v1.audio.generate({
+            text,
+            model,
+            encoding: "linear16",
+            sample_rate: parseInt(sampleRate),
+            container: "none",
+        });
+        const stream = response.stream();
         if (!stream) {
             ttsLog.error({ provider: "deepgram" }, "TTS returned no stream");
             return;
@@ -312,7 +310,7 @@ async function elevenlabsGeneratePCM(text, sampleRate = "16000") {
     const apiKey = process.env.ELEVENLABS_API_KEY;
     if (!apiKey) { ttsLog.error({ provider: "elevenlabs" }, "ELEVENLABS_API_KEY missing"); return null; }
 
-    const voiceId = process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM";
+    const voiceId = process.env.ELEVENLABS_VOICE_ID || "JBFqnCBsd6RMkjVDRZzb";
     const modelId = process.env.ELEVENLABS_MODEL_ID || "eleven_turbo_v2_5";
 
     try {
@@ -347,7 +345,7 @@ async function* elevenlabsGeneratePCMPipelined(text, sampleRate = "16000") {
     const apiKey = process.env.ELEVENLABS_API_KEY;
     if (!apiKey) { ttsLog.error({ provider: "elevenlabs" }, "ELEVENLABS_API_KEY missing"); return; }
 
-    const voiceId = process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM";
+    const voiceId = process.env.ELEVENLABS_VOICE_ID || "JBFqnCBsd6RMkjVDRZzb";
     const modelId = process.env.ELEVENLABS_MODEL_ID || "eleven_turbo_v2_5";
 
     try {
@@ -423,30 +421,57 @@ const providers = {
     },
 };
 
-function getProvider() {
-    const name = (process.env.INTERVIEW_TTS_PROVIDER || "polly").toLowerCase();
-    const provider = providers[name];
-    if (!provider) {
-        ttsLog.warn({ requested: name, available: Object.keys(providers) }, "Unknown TTS provider, falling back to polly");
-        return providers.polly;
-    }
-    return provider;
-}
-
 // Log which provider is active at import time
 const activeProviderName = (process.env.INTERVIEW_TTS_PROVIDER || "polly").toLowerCase();
 ttsLog.info({ provider: activeProviderName }, "Interview TTS provider loaded");
+
+/**
+ * Build ordered fallback chain starting from the configured provider.
+ * e.g. elevenlabs → polly → deepgram
+ */
+function buildFallbackChain(primary) {
+    const all = ["polly", "deepgram", "elevenlabs"];
+    const rest = all.filter(p => p !== primary && providers[p]);
+    const resolved = providers[primary] ? [primary, ...rest] : rest;
+    return resolved;
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // PUBLIC API — same signatures as before, worker.js doesn't change
 // ═══════════════════════════════════════════════════════════════════
 
 export async function generatePCM(text, sampleRate = "16000") {
-    return getProvider().generatePCM(text, sampleRate);
+    const chain = buildFallbackChain(activeProviderName);
+    for (let i = 0; i < chain.length; i++) {
+        const name = chain[i];
+        const pcm = await providers[name].generatePCM(text, sampleRate);
+        if (pcm) return pcm;
+        if (i < chain.length - 1) {
+            ttsLog.warn({ failed: name, next: chain[i + 1] }, "TTS provider returned null, trying fallback");
+        }
+    }
+    ttsLog.error({ chain }, "All TTS providers failed");
+    return null;
 }
 
 export async function* generatePCMPipelined(text, sampleRate = "16000") {
-    yield* getProvider().generatePCMPipelined(text, sampleRate);
+    const chain = buildFallbackChain(activeProviderName);
+    for (let i = 0; i < chain.length; i++) {
+        const name = chain[i];
+        let chunksYielded = 0;
+        try {
+            for await (const chunk of providers[name].generatePCMPipelined(text, sampleRate)) {
+                chunksYielded++;
+                yield chunk;
+            }
+        } catch (err) {
+            ttsLog.warn({ failed: name, err: err.message }, "TTS provider threw during stream");
+        }
+        if (chunksYielded > 0) return; // provider succeeded
+        if (i < chain.length - 1) {
+            ttsLog.warn({ failed: name, next: chain[i + 1] }, "TTS provider yielded nothing, trying fallback");
+        }
+    }
 }
 
 /**
@@ -458,7 +483,7 @@ async function elevenlabsGetSpeechMarks(text) {
     const apiKey = process.env.ELEVENLABS_API_KEY;
     if (!apiKey) return estimateWordTimings(text);
 
-    const voiceId = process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM";
+    const voiceId = process.env.ELEVENLABS_VOICE_ID || "JBFqnCBsd6RMkjVDRZzb";
     const modelId = process.env.ELEVENLABS_MODEL_ID || "eleven_turbo_v2_5";
 
     try {

@@ -31,6 +31,10 @@ export class DeepgramSTT extends EventEmitter {
         // Improvement #4: Acoustic metadata — per-utterance timing + filler tracking
         this._utteranceStartMs = 0;   // timestamp of first final chunk for this utterance
         this._fillerWordCount = 0;     // running count of uh/um/er in current utterance
+
+        // Incomplete-transcript guard: if speech_final fires mid-clause (e.g. "can you",
+        // "and the", "because"), hold for 2s before emitting in case the user continues.
+        this._pendingFinalTimer = null;
     }
 
     start() {
@@ -46,28 +50,34 @@ export class DeepgramSTT extends EventEmitter {
 
         const sampleRate = process.env.DEEPGRAM_STT_SAMPLE_RATE || "48000";
 
-        const params = new URLSearchParams({
+        const useFlux = process.env.DEEPGRAM_USE_FLUX === 'true';
+        const model = useFlux ? 'flux' : this.model;
+
+        const baseParams = {
             encoding: "linear16",
             sample_rate: sampleRate,
             channels: "1",
-            model: this.model,
+            model,
             language: this.language,
             smart_format: String(this.smartFormat),
             filler_words: "true",
             interim_results: "true",
-            endpointing: String(this.endpointing),
-            // utterance_end_ms: extra silence buffer after speech_final detection
-            // Gives more time for natural pauses in longer answers
-            utterance_end_ms: process.env.DEEPGRAM_STT_UTTERANCE_END_MS || "1500",
-            // VAD events: get notified when speech starts/stops for better turn management
             vad_events: "true",
-            // Punctuation for cleaner transcripts
             punctuate: "true",
-        });
+        };
+
+        if (useFlux) {
+            baseParams.eot_threshold = process.env.DEEPGRAM_FLUX_EOT_THRESHOLD || "0.7";
+        } else {
+            baseParams.endpointing = String(this.endpointing);
+            baseParams.utterance_end_ms = process.env.DEEPGRAM_STT_UTTERANCE_END_MS || "1500";
+        }
+
+        const params = new URLSearchParams(baseParams);
 
         const url = `wss://api.deepgram.com/v1/listen?${params.toString()}`;
 
-        agentLog.info({ model: this.model, endpointingMs: this.endpointing }, 'STT connecting to Deepgram');
+        agentLog.info({ model, endpointingMs: useFlux ? null : this.endpointing, flux: useFlux }, 'STT connecting to Deepgram');
         this._connectTs = Date.now();
 
         this.socket = new WebSocket(url, {
@@ -91,6 +101,9 @@ export class DeepgramSTT extends EventEmitter {
 
                     if (text) {
                         if (msg.is_final) {
+                            // New speech arrived — cancel any pending hold timer
+                            this._clearPendingFinal();
+
                             // Track utterance start on first final chunk
                             if (!this._utteranceStartMs) {
                                 this._utteranceStartMs = Date.now();
@@ -104,17 +117,31 @@ export class DeepgramSTT extends EventEmitter {
                     }
 
                     if (msg.speech_final) {
-                        this._emitFinal('speech_final');
+                        if (this.currentTranscript.trim().length > 0 && this._looksIncomplete(this.currentTranscript)) {
+                            agentLog.info(
+                                { snippet: this.currentTranscript.trim().slice(-40) },
+                                'STT speech_final: incomplete clause detected, holding 2s'
+                            );
+                            this._schedulePendingFinal();
+                        } else {
+                            this._clearPendingFinal();
+                            this._emitFinal('speech_final');
+                        }
                     }
                 }
 
-                // UtteranceEnd: Deepgram detected a long silence gap after the last
-                // finalized word. Acts as a safety net if speech_final didn't fire.
+                // UtteranceEnd: absolute safety net — fires after utterance_end_ms of
+                // silence. Always emits whatever is buffered, cancelling any held timer.
                 if (msg.type === "UtteranceEnd") {
                     if (this.currentTranscript.trim().length > 0) {
+                        this._clearPendingFinal();
                         agentLog.info('STT UtteranceEnd fallback — flushing buffered transcript');
                         this._emitFinal('utterance_end');
                     }
+                }
+
+                if (msg.type === "SpeechStarted") {
+                    this.emit("speechStarted");
                 }
             } catch (err) {
                 agentLog.error({ err: err.message }, 'STT parse error');
@@ -156,6 +183,38 @@ export class DeepgramSTT extends EventEmitter {
         if (this._keepaliveTimer) {
             clearInterval(this._keepaliveTimer);
             this._keepaliveTimer = null;
+        }
+    }
+
+    /**
+     * Returns true when the transcript tail is a dangling clause — conjunction,
+     * preposition, article, or question fragment — with no terminal punctuation.
+     * High-precision check: only flags clear mid-sentence cut-offs.
+     */
+    _looksIncomplete(text) {
+        const t = text.trim().toLowerCase().replace(/[,;:]+$/, '');
+        // smart_format adds '.', '?', '!' to complete sentences
+        if (/[.?!]$/.test(t)) return false;
+        // Words that almost never end a complete thought
+        const dangling = /\b(and|but|or|nor|so|yet|because|although|though|since|unless|while|if|when|the|a|an|this|that|these|those|to|for|with|on|in|at|of|from|by|can you|could you|would you|will you|how do|how does|what is|what are|where is)\s*$/;
+        return dangling.test(t);
+    }
+
+    _schedulePendingFinal() {
+        this._clearPendingFinal();
+        this._pendingFinalTimer = setTimeout(() => {
+            this._pendingFinalTimer = null;
+            if (this.currentTranscript.trim().length > 0) {
+                agentLog.info('STT delayed emit after incomplete-clause hold');
+                this._emitFinal('speech_final_delayed');
+            }
+        }, 2000);
+    }
+
+    _clearPendingFinal() {
+        if (this._pendingFinalTimer) {
+            clearTimeout(this._pendingFinalTimer);
+            this._pendingFinalTimer = null;
         }
     }
 
@@ -207,6 +266,7 @@ export class DeepgramSTT extends EventEmitter {
     stop() {
         this._stopped = true;
         this._stopKeepalive();
+        this._clearPendingFinal();
         if (this.socket) {
             this.socket.close();
             this.socket = null;
