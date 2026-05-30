@@ -82,7 +82,6 @@ export function createInterviewRoutes({ sessionCache, activeAgents, activeVoiceA
                 userProfileContext,
                 candidateName: req.user?.name || "there",
                 timeGreeting: greetingData.timeGreeting,
-                greetingMessage: greetingData.greeting, // Full personalized greeting
             };
 
             // Use a unique thread_id per interview run so the PostgresSaver checkpointer
