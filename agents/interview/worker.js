@@ -242,7 +242,7 @@ export class InterviewAgentWorker extends VoicePipelineWorker {
      * Speak personalised intro + first question.
      * Called fire-and-forget from routes/interview.js.
      */
-    async speakIntro(firstQuestion) {
+    async speakIntro(firstQuestion, isResume = false) {
         if (!firstQuestion) return;
         this.processingTurn = true;
         const safetyTimer = setTimeout(() => {
@@ -252,8 +252,10 @@ export class InterviewAgentWorker extends VoicePipelineWorker {
             }
         }, 30000);
         try {
-            const introText = `Hello, ${this.candidateName}! Welcome to your AI voice interview. I will ask you ${this.maxQuestions} questions based on the document you uploaded. Please answer each question clearly after I finish speaking. Let's begin!`;
-            agentLog.info({ sessionId: this.sessionId, candidateName: this.candidateName }, 'Speaking intro');
+            const introText = isResume
+                ? `Welcome back, ${this.candidateName}! Your interview session was interrupted. Let's continue right where we left off. Here is your question again.`
+                : `Hello, ${this.candidateName}! Welcome to your AI voice interview. I will ask you ${this.maxQuestions} questions based on the document you uploaded. Please answer each question clearly after I finish speaking. Let's begin!`;
+            agentLog.info({ sessionId: this.sessionId, candidateName: this.candidateName, isResume }, 'Speaking intro');
 
             // Speak intro with subtitles
             await this._speakAndEmit(introText, true, false);

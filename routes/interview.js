@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { registerVectorStore, clearSessionInterviewState, parseTTSResponse } from "../lib/interview/interviewAgent.js";
 import { InterviewAgentWorker } from "../agents/interview/worker.js";
 import { optionalAuth } from "../middleware/auth.js";
-import { getDocumentBySessionId, saveInterviewResult, logActivity } from "../lib/db.js";
+import { getDocumentBySessionId, saveInterviewResult, logActivity, upsertActiveInterview, getActiveInterview, clearActiveInterview } from "../lib/db.js";
 import { ensureSession } from "../lib/sessionRestore.js";
 import { updateUserProfileAfterInterview, getUserProfileContext } from "../lib/interview/profileUpdater.js";
 import { generateGreeting, generateSimpleGreeting } from "../lib/interview/greetingGenerator.js";
@@ -84,10 +84,35 @@ export function createInterviewRoutes({ sessionCache, activeAgents, activeVoiceA
                 timeGreeting: greetingData.timeGreeting,
             };
 
-            // Use a unique thread_id per interview run so the PostgresSaver checkpointer
-            // never restores stale state (old finalReport, interviewStopped=true, old userAnswer)
-            // from a previous interview on the same sessionId.
-            const interviewRunId = `${sessionId}_${Date.now()}`;
+            // ── RESUME CHECK ─────────────────────────────────────────
+            // Look up any in-progress interview for this session in DB.
+            // If found, reconnect to its LangGraph checkpoint via the
+            // stored thread_id instead of starting fresh.
+            let isResume = false;
+            let interviewRunId = `${sessionId}_${Date.now()}`;
+
+            const activeRecord = await getActiveInterview(sessionId).catch(() => null);
+            if (activeRecord?.thread_id) {
+                // Verify the checkpoint actually exists by reading the state
+                try {
+                    const existingConfig = { configurable: { thread_id: activeRecord.thread_id } };
+                    const snap = await interviewAgent.getState(existingConfig);
+                    // snap.values exists and interview wasn't finished
+                    if (snap?.values && !snap.values.finalReport) {
+                        interviewRunId = activeRecord.thread_id;
+                        isResume = true;
+                        interviewLog.info({
+                            sessionId,
+                            threadId: interviewRunId,
+                            questionsAsked: snap.values.questionsAsked,
+                            currentQuestion: snap.values.currentQuestion?.substring(0, 80),
+                        }, 'Resuming existing interview from checkpoint');
+                    }
+                } catch (snapErr) {
+                    interviewLog.warn({ sessionId, err: snapErr.message }, 'Checkpoint read failed — starting fresh');
+                }
+            }
+
             const config = { configurable: { thread_id: interviewRunId } };
 
             // Clean up ALL existing agents on this session before starting a new one
@@ -102,6 +127,8 @@ export function createInterviewRoutes({ sessionCache, activeAgents, activeVoiceA
 
             // Store save callback so the agent worker can save results when interview ends
             session._onInterviewComplete = async (finalState) => {
+                // Clear the active interview record — interview is complete
+                clearActiveInterview(sessionId).catch(() => {});
                 if (req.user) {
                     try {
                         const doc = await getDocumentBySessionId(sessionId);
@@ -109,7 +136,7 @@ export function createInterviewRoutes({ sessionCache, activeAgents, activeVoiceA
                             await saveInterviewResult({
                                 userId: req.user.id,
                                 documentId: doc.id,
-                                threadId: sessionId,
+                                threadId: interviewRunId,
                                 questionsAsked: finalState.questionsAsked,
                                 scores: finalState.scores,
                                 topicScores: finalState.topicScores,
@@ -132,36 +159,48 @@ export function createInterviewRoutes({ sessionCache, activeAgents, activeVoiceA
                 }
             };
 
-            // Optimize: parallelize agent.start() and LangGraph invoke
-            // Both run concurrently — agent connects to LiveKit while LangGraph generates first question
+            // Parallelize agent.start() and LangGraph invoke
             const agentStartPromise = agent.start().catch(err => {
                 interviewLog.error({ err: err.message, sessionId }, 'Agent LiveKit connection failed');
-                // Retry once after 2s
                 setTimeout(() => {
-                    interviewLog.info({ sessionId }, 'Retrying agent LiveKit connection...');
                     agent.start().catch(err2 => {
                         interviewLog.error({ err: err2.message, sessionId }, 'Agent LiveKit retry failed');
                     });
                 }, 2000);
             });
 
-            const resultState = await interviewAgent.invoke(initialState, config);
+            let resultState;
+            if (isResume) {
+                // Load existing state from checkpoint — no re-invoke needed
+                const snap = await interviewAgent.getState(config);
+                resultState = snap.values;
+            } else {
+                resultState = await interviewAgent.invoke(initialState, config);
+                // Save the new thread_id so it can be resumed on reload
+                upsertActiveInterview({
+                    sessionId,
+                    userId: req.user?.id || null,
+                    threadId: interviewRunId,
+                    maxQuestions: parseInt(maxQuestions),
+                    questionsAsked: resultState.questionsAsked || 0,
+                    currentQuestion: resultState.currentQuestion || '',
+                }).catch(() => {});
+            }
 
             session.interviewStateConfig = config;
 
-            // Log activity if user is authenticated
             if (req.user) {
                 logActivity({
                     userId: req.user.id,
-                    action: 'interview_started',
+                    action: isResume ? 'interview_resumed' : 'interview_started',
                     metadata: { sessionId, maxQuestions: parseInt(maxQuestions) }
                 });
             }
 
             const { uniquePart } = parseTTSResponse(resultState.currentQuestion);
 
-            // Ensure agent connected before speaking (wait for agent.start + client ready, max 3s total)
-            interviewLog.info({ sessionId }, 'Waiting for agent ready + client audio ready');
+            // Ensure agent connected before speaking
+            interviewLog.info({ sessionId, isResume }, 'Waiting for agent ready + client audio ready');
             await Promise.all([
                 Promise.race([agentStartPromise, new Promise(r => setTimeout(r, 3000))]),
                 new Promise((resolve) => {
@@ -176,15 +215,16 @@ export function createInterviewRoutes({ sessionCache, activeAgents, activeVoiceA
                 })
             ]);
 
-            interviewLog.info({ sessionId }, 'Speaking first question');
-            agent.speakIntro(uniquePart).catch(err => {
+            interviewLog.info({ sessionId, isResume }, 'Speaking intro/resume');
+            agent.speakIntro(uniquePart, isResume).catch(err => {
                 interviewLog.error({ err: err.message, sessionId }, 'speakIntro error');
             });
 
             res.json({
                 questionNumber: resultState.questionsAsked,
                 difficulty: resultState.difficultyLevel,
-                agentStarted: true
+                agentStarted: true,
+                resumed: isResume,
             });
 
         } catch (error) {

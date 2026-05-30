@@ -1,6 +1,7 @@
 import { interviewStateChannels } from "../../lib/interview/interviewAgent.js";
 import { HumanMessage, AIMessage } from "@langchain/core/messages";
 import { agentLog } from "../../lib/logger.js";
+import { upsertActiveInterview } from "../../lib/db.js";
 
 /**
  * Acts as the bridge between the real-time LiveKit flow and your existing
@@ -48,7 +49,20 @@ export class SessionBridge {
         agentLog.info({ sessionId: this.sessionId, durationMs, done: !!resultState.finalReport }, 'SessionBridge invoke complete');
 
         const isDone = !!resultState.finalReport;
-        
+
+        // Keep the active interview record in sync with the latest question number
+        // and current question. This way a resume always shows the right question.
+        if (!isDone) {
+            upsertActiveInterview({
+                sessionId: this.sessionId,
+                userId: null, // user_id not available here; set on start
+                threadId: session.interviewStateConfig.configurable.thread_id,
+                maxQuestions: resultState.maxQuestions || 5,
+                questionsAsked: resultState.questionsAsked || 0,
+                currentQuestion: resultState.currentQuestion || '',
+            }).catch(() => {});
+        }
+
         return {
             done: isDone,
             intent: resultState.intent,
