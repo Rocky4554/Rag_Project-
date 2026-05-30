@@ -361,14 +361,14 @@ export class VoicePipelineWorker {
 
     // ── Audio playback ──────────────────────────────────────────
 
-    /** Push raw PCM to LiveKit and record when AI finished speaking.
-     *  Skips playback if the speech epoch advanced (barge-in) since the
-     *  caller started — prevents a queued chunk from resurrecting after stop(). */
+    /** Queue raw PCM into the audio buffer. Skips if the speech epoch advanced
+     *  (barge-in) since the caller started — prevents a queued chunk from
+     *  resurrecting after stop(). Does NOT wait for playout; the caller awaits
+     *  audioPublisher.waitForPlayout() once after the full utterance. */
     async _playAudio(pcm, epoch) {
         if (!pcm) return;
         if (epoch !== undefined && epoch !== this._speechEpoch) return;
         await this.audioPublisher.pushPCM(pcm);
-        this.aiStoppedSpeakingAt = Date.now();
     }
 
     /**
@@ -414,6 +414,14 @@ export class VoicePipelineWorker {
             }
 
             await this._playAudio(pcm, myEpoch);
+        }
+
+        // Wait for the jitter buffer to drain so we don't cut off the tail of
+        // the utterance or report "done speaking" while audio is still playing.
+        // Skipped on barge-in (epoch changed) — stop() already flushed the queue.
+        if (this._speechEpoch === myEpoch) {
+            await this.audioPublisher.waitForPlayout();
+            this.aiStoppedSpeakingAt = Date.now();
         }
 
         if (emitEnd) this._emitToRoom('ai_speech', { action: 'end' });

@@ -290,6 +290,9 @@ export class InterviewAgentWorker extends VoicePipelineWorker {
                 const marks = estimateWordTimings(fallbackText);
                 if (marks.length > 0) this._emitToRoom('ai_subtitle', { words: marks, text: fallbackText });
                 await this._playAudio(pcm);
+                // Wait for the buffered audio to finish before ending the turn.
+                await this.audioPublisher.waitForPlayout();
+                this.aiStoppedSpeakingAt = Date.now();
                 this._emitToRoom('ai_speech', { action: 'end' });
                 return;
             }
