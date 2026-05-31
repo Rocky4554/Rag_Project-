@@ -389,8 +389,30 @@ export class VoicePipelineWorker {
             ? Promise.resolve(estimateWordTimings(text))
             : getSpeechMarks(text).catch(() => estimateWordTimings(text));
 
-        let textEmitted = false;
         let firstChunk = true;
+
+        // ── Pre-roll buffer ─────────────────────────────────────────
+        // The native AudioSource starts playing the INSTANT it receives the
+        // first frame. The TTS first chunk is often tiny (~40ms), so if the
+        // second chunk is even slightly delayed the buffer underruns and you
+        // hear the voice "drop then pick up". We accumulate ~400ms of audio
+        // before the first frame is queued, giving the jitter buffer a head
+        // start so playback stays continuous.
+        const PREROLL_SAMPLES = Math.floor(this.sampleRate * 0.4); // ~400ms lead
+        let preroll = [];
+        let prerollLen = 0;
+        let prerollDone = false;
+
+        const flushPreroll = async () => {
+            prerollDone = true;
+            if (prerollLen === 0) return;
+            const combined = new Int16Array(prerollLen);
+            let o = 0;
+            for (const c of preroll) { combined.set(c, o); o += c.length; }
+            preroll = [];
+            prerollLen = 0;
+            await this._playAudio(combined, myEpoch);
+        };
 
         // Stream the FULL text in one TTS request — the provider streams chunks
         // continuously, which is smooth. Splitting per-sentence would add the
@@ -398,10 +420,7 @@ export class VoicePipelineWorker {
         for await (const { pcm, text: chunkText } of generatePCMPipelined(text, String(this.sampleRate))) {
             if (this._speechEpoch !== myEpoch) break;
 
-            if (chunkText && !textEmitted) {
-                this._emitToRoom('ai_speech', { action: 'sentence', text: chunkText });
-                textEmitted = true;
-            } else if (chunkText) {
+            if (chunkText) {
                 this._emitToRoom('ai_speech', { action: 'sentence', text: chunkText });
             }
 
@@ -413,8 +432,19 @@ export class VoicePipelineWorker {
                 }
             }
 
-            await this._playAudio(pcm, myEpoch);
+            if (!pcm || pcm.length === 0) continue;
+
+            if (!prerollDone) {
+                preroll.push(pcm);
+                prerollLen += pcm.length;
+                if (prerollLen >= PREROLL_SAMPLES) await flushPreroll();
+            } else {
+                await this._playAudio(pcm, myEpoch);
+            }
         }
+
+        // Flush leftover pre-roll (utterance shorter than the pre-roll window).
+        if (this._speechEpoch === myEpoch && !prerollDone) await flushPreroll();
 
         // Wait for the jitter buffer to drain so we don't cut off the tail of
         // the utterance or report "done speaking" while audio is still playing.
