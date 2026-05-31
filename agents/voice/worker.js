@@ -53,6 +53,10 @@ function stripThinkingText(text) {
 const LIVE_API_VERSION = process.env.GEMINI_LIVE_API_VERSION || 'v1beta';
 const INPUT_SAMPLE_RATE = 16000;   // LiveKit mic → Gemini
 const OUTPUT_SAMPLE_RATE = 24000;  // Gemini audio response → LiveKit
+// Pre-roll: buffer ~250ms before the first frame reaches the native AudioSource
+// (which starts playing instantly) so it doesn't underrun on Gemini's first tiny
+// chunk — that underrun is heard as the voice "dropping then picking up".
+const PREROLL_SAMPLES = Math.floor((OUTPUT_SAMPLE_RATE * 250) / 1000);
 
 export class VoiceAgentWorker {
     constructor(sessionId, sessionCache, io, userId = null, userName = null) {
@@ -68,6 +72,8 @@ export class VoiceAgentWorker {
         this.isActive = false;
         this._audioQueue = [];
         this._playingAudio = false;
+        this._prerollMet = false;  // has the startup pre-roll filled for this turn?
+        this._turnEnded = false;   // did Gemini signal turnComplete?
     }
 
     async start() {
@@ -364,6 +370,11 @@ export class VoiceAgentWorker {
             if (msg.serverContent.modelTurn?.parts) {
                 for (const part of msg.serverContent.modelTurn.parts) {
                     if (part.inlineData?.mimeType?.startsWith('audio/')) {
+                        // First audio chunk of a new speaking turn → re-arm pre-roll
+                        if (this._turnEnded) {
+                            this._turnEnded = false;
+                            this._prerollMet = false;
+                        }
                         const buf = Buffer.from(part.inlineData.data, 'base64');
                         const pcm = new Int16Array(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
                         this._audioQueue.push(pcm);
@@ -381,6 +392,9 @@ export class VoiceAgentWorker {
             // Turn complete — signal AI is done speaking
             if (msg.serverContent.turnComplete) {
                 agentLog.debug({ sessionId: this.sessionId, type: 'voice' }, 'Gemini turn complete');
+                // Turn ended — flush any tail still under the pre-roll threshold.
+                this._turnEnded = true;
+                this._processAudioQueue();
                 if (this.io) {
                     this.io.to(this.sessionId).emit('voice_state', { state: 'listening' });
                 }
@@ -459,6 +473,18 @@ export class VoiceAgentWorker {
 
     async _processAudioQueue() {
         if (this._playingAudio) return;
+
+        // Startup pre-roll gate: hold back the first frames until ~250ms is
+        // buffered (or the turn has ended) so the native AudioSource — which
+        // starts playing the instant it gets a frame — doesn't underrun on the
+        // first tiny chunk. Once met, drain continuously for the rest of the turn.
+        if (!this._prerollMet && !this._turnEnded) {
+            let buffered = 0;
+            for (const c of this._audioQueue) buffered += c.length;
+            if (buffered < PREROLL_SAMPLES) return; // wait for more chunks
+            this._prerollMet = true;
+        }
+
         this._playingAudio = true;
         try {
             while (this._audioQueue.length > 0) {
@@ -476,6 +502,8 @@ export class VoiceAgentWorker {
 
     _stopSpeaking() {
         this._audioQueue = [];
+        this._prerollMet = false;
+        this._turnEnded = false;
         this.audioPublisher.stop();
     }
 
