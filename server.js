@@ -12,6 +12,7 @@ import { Server as SocketIOServer } from 'socket.io';
 import { validateEnv, printEnvStatus } from './lib/env.js';
 import { serverLog, httpLogger } from './lib/logger.js';
 import { registerSocket, unregisterSocket, createInterviewAgent, clearSessionInterviewState } from "./lib/interview/interviewAgent.js";
+import { createDeepInterviewAgent } from "./lib/interview/deepInterviewAgent.js";
 import { createUploadRoutes } from './routes/upload.js';
 import { createChatRoutes } from './routes/chat.js';
 import { createQuizRoutes } from './routes/quiz.js';
@@ -177,14 +178,17 @@ function errorHandler(err, req, res, _next) {
 // ── Initialize & Start ──────────────────────────────────────────
 async function startServer() {
     // Initialize the interview agent with PostgresSaver (async)
-    serverLog.info('Initializing interview agent...');
+    // INTERVIEW_AGENT_MODE=deep → intelligent orchestrator agent; else classic.
+    const useDeepAgent = process.env.INTERVIEW_AGENT_MODE === 'deep';
+    const agentFactory = useDeepAgent ? createDeepInterviewAgent : createInterviewAgent;
+    serverLog.info({ mode: useDeepAgent ? 'deep' : 'classic' }, 'Initializing interview agent...');
     let interviewAgent;
     try {
-        interviewAgent = await createInterviewAgent();
-        serverLog.info('Interview agent ready (PostgresSaver)');
+        interviewAgent = await agentFactory();
+        serverLog.info({ mode: useDeepAgent ? 'deep' : 'classic' }, 'Interview agent ready (PostgresSaver)');
     } catch (err) {
         serverLog.warn({ err: err.message }, 'PostgresSaver failed, using no checkpointer');
-        interviewAgent = await createInterviewAgent(null);
+        interviewAgent = await agentFactory(null);
     }
 
     // ── Routes with rate limiters ────────────────────────────────

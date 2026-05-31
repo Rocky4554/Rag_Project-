@@ -13,7 +13,7 @@ import { getUserProfileContext } from '../../lib/interview/profileUpdater.js';
 import { agentLog } from '../../lib/logger.js';
 
 // Override via GEMINI_LIVE_MODEL env var. Run: node scripts/listLiveModels.js to see options.
-const VOICE_MODEL = process.env.GEMINI_LIVE_MODEL || 'gemini-2.5-flash-native-audio-latest';
+const VOICE_MODEL = process.env.GEMINI_LIVE_MODEL || 'gemini-3.1-flash-live-preview';
 
 /**
  * Strip Gemini's internal thinking/reasoning from output transcription.

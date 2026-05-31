@@ -73,7 +73,7 @@ export async function checkSemanticCompleteness(text) {
         }
 
         const genAI = new GoogleGenerativeAI(apiKey);
-        const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash-lite" });
+        const model = genAI.getGenerativeModel({ model: process.env.GEMINI_MINI_MODEL || "gemini-3.1-flash-lite" });
 
         // Race the Gemini call against a 2-second timeout
         const timeoutPromise = new Promise((_resolve, reject) =>
