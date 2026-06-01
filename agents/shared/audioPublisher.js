@@ -23,6 +23,7 @@ export class AudioPublisher {
         this.source = new AudioSource(sampleRate, channels, QUEUE_SIZE_MS);
         this.isSpeaking = false;
         this.stopFlag = false;
+        this._queuedMs = 0; // estimated audio queued since the last waitForPlayout
     }
 
     /**
@@ -35,6 +36,7 @@ export class AudioPublisher {
         if (!pcmData || pcmData.length === 0) return;
         this.isSpeaking = true;
         this.stopFlag = false;
+        this._queuedMs += (pcmData.length / this.sampleRate) * 1000;
 
         const startTime = performance.now();
         let chunksSent = 0;
@@ -79,11 +81,26 @@ export class AudioPublisher {
 
     /**
      * Wait for the native buffer to fully drain (i.e. audio actually finished
-     * playing), then mark speech as done. Safe to call when nothing is queued.
+     * playing), then mark speech as done.
+     *
+     * CRITICAL: never hang. If nothing was queued (e.g. TTS produced no audio),
+     * return immediately. Otherwise race the native drain against a safety
+     * timeout (queued duration + 3s) so a stuck native promise can't freeze the
+     * whole turn — this was causing "agent not speaking" in production when a
+     * TTS provider returned empty.
      */
     async waitForPlayout() {
+        const expectedMs = this._queuedMs;
+        this._queuedMs = 0;
+        if (expectedMs <= 0) {
+            this.isSpeaking = false;
+            return;
+        }
         try {
-            await this.source.waitForPlayout();
+            await Promise.race([
+                this.source.waitForPlayout(),
+                new Promise((res) => setTimeout(res, expectedMs + 3000)),
+            ]);
         } catch {
             /* source may be closed — ignore */
         }
@@ -94,6 +111,7 @@ export class AudioPublisher {
     stop() {
         this.stopFlag = true;
         this.isSpeaking = false;
+        this._queuedMs = 0;
         try {
             // Flush the ~1s of buffered audio so an interrupt cuts off
             // immediately instead of playing out the remaining queue.

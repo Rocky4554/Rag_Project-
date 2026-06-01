@@ -446,6 +446,16 @@ export class VoicePipelineWorker {
         // Flush leftover pre-roll (utterance shorter than the pre-roll window).
         if (this._speechEpoch === myEpoch && !prerollDone) await flushPreroll();
 
+        // Diagnostic: if the TTS stream yielded nothing, the agent stays silent.
+        // This is the #1 cause of "agent not speaking" in production — usually a
+        // missing/invalid TTS provider key or a wrong INTERVIEW_TTS_PROVIDER.
+        if (firstChunk) {
+            agentLog.warn(
+                { sessionId: this.sessionId, provider, textPreview: text.substring(0, 60) },
+                'TTS produced NO audio — check INTERVIEW_TTS_PROVIDER and its API key'
+            );
+        }
+
         // Wait for the jitter buffer to drain so we don't cut off the tail of
         // the utterance or report "done speaking" while audio is still playing.
         // Skipped on barge-in (epoch changed) — stop() already flushed the queue.
