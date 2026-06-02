@@ -190,7 +190,7 @@ function getDeepgramTTSClient() {
 async function deepgramGeneratePCM(text, sampleRate = "16000") {
     if (!text?.trim()) return null;
     const start = performance.now();
-    const model = process.env.DEEPGRAM_TTS_MODEL || "aura-2-en";
+    const model = process.env.DEEPGRAM_TTS_MODEL || "aura-asteria-en";
 
     try {
         ttsLog.info({ provider: "deepgram", textLen: text.length, model }, "TTS request");
@@ -228,7 +228,7 @@ async function deepgramGeneratePCM(text, sampleRate = "16000") {
 async function* deepgramGeneratePCMPipelined(text, sampleRate = "16000") {
     if (!text?.trim()) return;
     const start = performance.now();
-    const model = process.env.DEEPGRAM_TTS_MODEL || "aura-2-en";
+    const model = process.env.DEEPGRAM_TTS_MODEL || "aura-asteria-en";
 
     try {
         ttsLog.info({ provider: "deepgram", textLen: text.length, model, streaming: true }, "TTS stream start");
