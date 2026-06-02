@@ -69,14 +69,19 @@ export class AudioPublisher {
             // captureFrame backpressures on the native buffer — no manual pacing.
             try {
                 await this.source.captureFrame(frame);
-            } catch {
+            } catch (err) {
                 // Source closed or queue cleared (barge-in) — stop feeding.
+                agentLog.warn({ err: err?.message, chunksSent }, 'AudioPublisher captureFrame failed');
                 break;
             }
             chunksSent++;
         }
 
-        agentLog.debug({ chunksSent, queuedMs: Math.round(performance.now() - startTime) }, 'AudioPublisher chunk queued');
+        // INFO-level so production logs confirm audio is actually being published.
+        agentLog.info(
+            { chunksSent, samples: pcmData.length, sampleRate: this.sampleRate, queueMs: Math.round(performance.now() - startTime) },
+            'AudioPublisher queued audio'
+        );
     }
 
     /**
