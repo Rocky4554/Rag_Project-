@@ -176,10 +176,14 @@ export function createInterviewRoutes({ sessionCache, activeAgents, activeVoiceA
                 resultState = snap.values;
             } else {
                 resultState = await interviewAgent.invoke(initialState, config);
-                // Save the new thread_id so it can be resumed on reload
+                // Save the new thread_id so it can be resumed on reload.
+                // user_id is left null on purpose: the active_interviews FK targets
+                // auth.users, but app user IDs aren't stored there — passing req.user.id
+                // violated the FK. The resume lookup is keyed by session_id, so the
+                // user association isn't needed here.
                 upsertActiveInterview({
                     sessionId,
-                    userId: req.user?.id || null,
+                    userId: null,
                     threadId: interviewRunId,
                     maxQuestions: parseInt(maxQuestions),
                     questionsAsked: resultState.questionsAsked || 0,
