@@ -7,6 +7,7 @@ import { QdrantClient } from "@qdrant/js-client-rest";
 import { extractTextFromPDF } from "../lib/pipeline/pdfLoader.js";
 import { splitText } from "../lib/pipeline/textSplitter.js";
 import { storeDocuments } from "../lib/pipeline/vectorStore.js";
+import { buildBM25Index, persistBM25Index } from "../lib/pipeline/bm25Index.js";
 import { imageEmbedder } from "../lib/embeddings.js";
 import { optionalAuth } from "../middleware/auth.js";
 import { saveDocument, logActivity } from "../lib/db.js";
@@ -96,8 +97,12 @@ export function createUploadRoutes({ sessionCache, upload }) {
                 const storeMs = Math.round(performance.now() - storeStart);
                 uploadLog.info({ step: 'embed+store', durationMs: storeMs, chunks: docs.length }, 'Documents embedded and stored in Qdrant');
 
+                const bm25Index = buildBM25Index(docs);
+                persistBM25Index(bm25Index, sessionId).catch(() => {});
+
                 sessionCache[sessionId] = {
                     vectorStore,
+                    bm25Index,
                     docs,
                     chatHistory: [],
                     interviewState: null,
@@ -268,8 +273,12 @@ export function createUploadRoutes({ sessionCache, upload }) {
             const storeMs = Math.round(performance.now() - storeStart);
             uploadLog.info({ step: 'embed+store', durationMs: storeMs, chunks: docs.length }, 'Text embedded and stored in Qdrant');
 
+            const bm25Index = buildBM25Index(docs);
+            persistBM25Index(bm25Index, sessionId).catch(() => {});
+
             sessionCache[sessionId] = {
                 vectorStore,
+                bm25Index,
                 docs,
                 chatHistory: [],
                 interviewState: null,

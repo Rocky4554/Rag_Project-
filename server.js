@@ -23,6 +23,7 @@ import { createAuthRoutes } from './routes/auth.js';
 import { createHistoryRoutes } from './routes/history.js';
 import { createSessionRoutes } from './routes/session.js';
 import { createConversationalAiRoutes } from './routes/conversationalAI.js';
+import { cleanupOldBM25Files } from './lib/pipeline/bm25Index.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -76,6 +77,10 @@ setInterval(() => {
         serverLog.info({ cleaned, remaining: Object.keys(sessionCache).length }, 'Session cleanup');
     }
 }, 10 * 60 * 1000); // check every 10 minutes
+
+// ── BM25 disk cache cleanup ───────────────────────────────────────
+cleanupOldBM25Files(7).catch(() => {}); // run once at startup
+setInterval(() => cleanupOldBM25Files(7).catch(() => {}), 24 * 60 * 60 * 1000); // repeat daily
 
 // ── Socket.io ────────────────────────────────────────────────────
 io.on('connection', (socket) => {
