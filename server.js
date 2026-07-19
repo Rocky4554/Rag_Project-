@@ -129,7 +129,17 @@ app.use(cors({ origin: allowedOrigins, methods: ['GET', 'POST', 'DELETE'], crede
 app.use(cookieParser());
 app.use(express.json({ limit: '5mb' }));
 app.use(httpLogger);
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, 'public'), {
+    setHeaders: (res, filePath) => {
+        // index.html is a single-file app whose JS talks to this server's API
+        // contract. A deploy that changes that contract (e.g. a form field
+        // name) paired with a cached stale page is a silent, hard-to-diagnose
+        // failure — force every navigation to fetch the current version.
+        if (filePath.endsWith('.html')) {
+            res.setHeader('Cache-Control', 'no-store');
+        }
+    },
+}));
 
 // ── Health check (before all route handlers) ────────────────────
 app.get('/ping', (req, res) => {
