@@ -148,8 +148,11 @@ export class DeepgramSTT extends EventEmitter {
             }
         });
 
-        this.socket.on("close", () => {
-            agentLog.info('STT Deepgram WebSocket closed');
+        this.socket.on("close", (code, reason) => {
+            agentLog.info(
+                { code, reason: reason?.toString() || null, openMs: Math.round(Date.now() - (this._connectTs || Date.now())) },
+                'STT Deepgram WebSocket closed'
+            );
             this.isReady = false;
             this._stopKeepalive();
 
