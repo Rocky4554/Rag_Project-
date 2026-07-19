@@ -164,7 +164,15 @@ export function createInterviewRoutes({ sessionCache, activeAgents, activeVoiceA
                 interviewLog.error({ err: err.message, sessionId }, 'Agent LiveKit connection failed');
                 setTimeout(() => {
                     agent.start().catch(err2 => {
-                        interviewLog.error({ err: err2.message, sessionId }, 'Agent LiveKit retry failed');
+                        interviewLog.error({ err: err2.message, sessionId }, 'Agent LiveKit retry failed — giving up');
+                        // agent.start() already stops its own STT/room on failure; drop
+                        // the dead agent so it doesn't block a future retry for this session.
+                        if (activeAgents.get(sessionId) === agent) {
+                            activeAgents.delete(sessionId);
+                        }
+                        if (io) {
+                            io.to(sessionId).emit('interview_error', { error: 'Voice connection failed. Please try starting the interview again.' });
+                        }
                     });
                 }, 2000);
             });

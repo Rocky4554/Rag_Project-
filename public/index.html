@@ -1294,6 +1294,10 @@
                 document.getElementById('iv-report-content').innerHTML = report.replace(/\n/g, '<br>');
             });
 
+            socket.on('interview_error', ({ error }) => {
+                ivSetState('idle', error || 'Something went wrong. Please try again.');
+            });
+
             // ── ai_feedback: real-time score/quality event ──
             socket.on('ai_feedback', ({ score, answerQuality }) => {
                 console.log(`[Socket] ai_feedback: quality=${answerQuality}, score=${score}`);
