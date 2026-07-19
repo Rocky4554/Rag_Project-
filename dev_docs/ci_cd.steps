@@ -1,4 +1,17 @@
 
+  *** DEPRECATED / STALE ***
+  The GitHub Actions workflow this describes (.github/workflows/deploy.yml,
+  build -> GHCR -> SSH into EC2) is still in the repo but is NOT the live
+  deployment target as of 2026-07-19. The backend now runs on Render, which
+  redeploys automatically on push to main — no GHCR pull or SSH step
+  involved. The EC2/SSH workflow was observed failing in CI
+  ("dial tcp ***:22: i/o timeout") around the same time; it was not
+  investigated further once Render was confirmed as the real target.
+  Kept below for reference in case EC2 deploys are revived. See
+  dev_docs/voice_agent_not_starting_fix.md and performance_optimizations.md
+  for the most recent production work (both shipped via the Render path).
+  ***************************
+
   SSH into your EC2 instance and run:
 
   # Install Docker
