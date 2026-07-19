@@ -189,6 +189,19 @@ const upload = multer({
 
 // ── Global error handler ─────────────────────────────────────────
 function errorHandler(err, req, res, _next) {
+    // Multer's "Unexpected field" only ever means the multipart field name the
+    // client sent doesn't match what the route's upload.single(...)/array(...)
+    // expects. err.field carries the exact name that was rejected — log it so
+    // a mismatch is provable from the field name itself instead of guessed at.
+    if (err.name === 'MulterError') {
+        serverLog.error({ code: err.code, field: err.field, path: req.path }, 'Multer upload rejected');
+        return res.status(400).json({
+            error: err.code === 'LIMIT_UNEXPECTED_FILE'
+                ? `Unexpected upload field "${err.field}" — please refresh the page and try again.`
+                : err.message,
+        });
+    }
+
     serverLog.error({ err: err.message, path: req.path }, 'Unhandled error');
     const status = err.status || 500;
     res.status(status).json({
