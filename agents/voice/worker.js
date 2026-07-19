@@ -96,6 +96,7 @@ export class VoiceAgentWorker {
         const systemPrompt = await this._buildSystemPrompt();
         agentLog.info({ sessionId: this.sessionId, ms: Math.round(performance.now() - promptTs), chars: systemPrompt.length, type: 'voice' }, '[1/4] System prompt ready');
 
+        try {
         // 2. Open Gemini Live WebSocket + LiveKit in parallel
         const geminiTs = performance.now();
         agentLog.info({ sessionId: this.sessionId, model: VOICE_MODEL, apiVersion: LIVE_API_VERSION, type: 'voice' }, '[2/4] Connecting to Gemini Live...');
@@ -162,6 +163,11 @@ export class VoiceAgentWorker {
                 const delay = 1000 * Math.pow(2, attempt - 1);
                 agentLog.info({ sessionId: this.sessionId, delayMs: delay, type: 'voice' }, `[3/4] Retrying in ${delay}ms...`);
                 await new Promise(r => setTimeout(r, delay));
+                // Disconnect the failed attempt before recreating — otherwise its
+                // signal client can keep retrying in the background with a stale
+                // token and get itself revoked once the next attempt connects
+                // with the same participant identity ("invalid token: revoked").
+                this.room.disconnect();
                 this.room = new Room();
                 this._setupRoomEvents();
             }
@@ -191,6 +197,16 @@ export class VoiceAgentWorker {
                 });
             }
         }, 300);
+        } catch (err) {
+            // Startup failed after the Gemini Live socket was already opened.
+            // stop() no-ops here because isActive is still false (only set true
+            // once LiveKit succeeds above) — close what was actually opened
+            // directly instead of leaving it orphaned.
+            agentLog.error({ sessionId: this.sessionId, err: err.message, type: 'voice' }, 'Conversational AI startup failed, cleaning up');
+            try { this.geminiSession?.close(); } catch (_) {}
+            try { this.room?.disconnect(); } catch (_) {}
+            throw err;
+        }
     }
 
     async _buildSystemPrompt() {
