@@ -15,7 +15,7 @@ export function createInterviewRoutes({ sessionCache, activeAgents, activeVoiceA
 
     router.post('/interview/start', validate(interviewStartSchema), optionalAuth, async (req, res) => {
         try {
-            const { sessionId, maxQuestions = 5, timezone } = req.validated;
+            const { sessionId, maxQuestions = 5, timezone, forceNew } = req.validated;
 
             // Try in-memory first, then auto-restore from DB+Qdrant
             const session = await ensureSession(sessionCache, sessionId);
@@ -93,28 +93,38 @@ export function createInterviewRoutes({ sessionCache, activeAgents, activeVoiceA
             // Look up any in-progress interview for this session in DB.
             // If found, reconnect to its LangGraph checkpoint via the
             // stored thread_id instead of starting fresh.
+            //
+            // Skipped entirely when forceNew is set — the client sends this
+            // when the user explicitly chose "Start New" over "Resume" after
+            // an interview was interrupted (closed tab, "End Interview"),
+            // since neither of those clears the resumable record on their own.
             let isResume = false;
             let interviewRunId = `${sessionId}_${Date.now()}`;
 
-            const activeRecord = await activeRecordPromise;
-            if (activeRecord?.thread_id) {
-                // Verify the checkpoint actually exists by reading the state
-                try {
-                    const existingConfig = { configurable: { thread_id: activeRecord.thread_id } };
-                    const snap = await interviewAgent.getState(existingConfig);
-                    // snap.values exists and interview wasn't finished
-                    if (snap?.values && !snap.values.finalReport) {
-                        interviewRunId = activeRecord.thread_id;
-                        isResume = true;
-                        interviewLog.info({
-                            sessionId,
-                            threadId: interviewRunId,
-                            questionsAsked: snap.values.questionsAsked,
-                            currentQuestion: snap.values.currentQuestion?.substring(0, 80),
-                        }, 'Resuming existing interview from checkpoint');
+            if (forceNew) {
+                await clearActiveInterview(sessionId).catch(() => {});
+                interviewLog.info({ sessionId }, 'forceNew requested — discarding any resumable interview');
+            } else {
+                const activeRecord = await activeRecordPromise;
+                if (activeRecord?.thread_id) {
+                    // Verify the checkpoint actually exists by reading the state
+                    try {
+                        const existingConfig = { configurable: { thread_id: activeRecord.thread_id } };
+                        const snap = await interviewAgent.getState(existingConfig);
+                        // snap.values exists and interview wasn't finished
+                        if (snap?.values && !snap.values.finalReport) {
+                            interviewRunId = activeRecord.thread_id;
+                            isResume = true;
+                            interviewLog.info({
+                                sessionId,
+                                threadId: interviewRunId,
+                                questionsAsked: snap.values.questionsAsked,
+                                currentQuestion: snap.values.currentQuestion?.substring(0, 80),
+                            }, 'Resuming existing interview from checkpoint');
+                        }
+                    } catch (snapErr) {
+                        interviewLog.warn({ sessionId, err: snapErr.message }, 'Checkpoint read failed — starting fresh');
                     }
-                } catch (snapErr) {
-                    interviewLog.warn({ sessionId, err: snapErr.message }, 'Checkpoint read failed — starting fresh');
                 }
             }
 
@@ -239,6 +249,7 @@ export function createInterviewRoutes({ sessionCache, activeAgents, activeVoiceA
 
             res.json({
                 questionNumber: resultState.questionsAsked,
+                maxQuestions: resultState.maxQuestions,
                 difficulty: resultState.difficultyLevel,
                 agentStarted: true,
                 resumed: isResume,
