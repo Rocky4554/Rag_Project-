@@ -1,7 +1,4 @@
 import { Router } from 'express';
-import os from 'os';
-import path from 'path';
-import fs from 'fs/promises';
 import { randomBytes } from 'crypto';
 import { QdrantClient } from "@qdrant/js-client-rest";
 import { extractTextFromPDF } from "../lib/pipeline/pdfLoader.js";
@@ -71,17 +68,13 @@ export function createUploadRoutes({ sessionCache, upload }) {
 
             if (isPdf) {
                 // ── PDF flow (existing) ─────────────────────────────
-                const tmpPath = path.join(os.tmpdir(), `rag-${sessionId}.pdf`);
-                await fs.writeFile(tmpPath, req.file.buffer);
+                // Parse straight from the in-memory buffer — writing it to
+                // /tmp and reading it back added a full disk round trip of the
+                // entire file to every upload.
 
                 // Step 1: PDF extraction
                 const extractStart = performance.now();
-                let text;
-                try {
-                    text = await extractTextFromPDF(tmpPath);
-                } finally {
-                    fs.unlink(tmpPath).catch(() => {});
-                }
+                const text = await extractTextFromPDF(req.file.buffer);
                 const extractMs = Math.round(performance.now() - extractStart);
                 uploadLog.info({ step: 'extract', durationMs: extractMs, pages: text.length }, 'PDF text extracted');
 

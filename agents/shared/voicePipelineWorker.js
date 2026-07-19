@@ -225,8 +225,11 @@ export class VoicePipelineWorker {
                 const wordCount = text.trim().split(/\s+/).filter(w => w).length;
                 if (wordCount >= this.bargeInMinWords) {
                     agentLog.info({ sessionId: this.sessionId, transcript: text.substring(0, 80), wordCount }, 'Barge-in detected');
+                    // No sleep needed: _interruptSpeech() bumps _speechEpoch and
+                    // audioPublisher.stop() is synchronous, and _playAudio()
+                    // short-circuits on epoch mismatch — so the in-flight
+                    // playback loop can't emit stale audio past this point.
                     this._interruptSpeech();
-                    await new Promise(r => setTimeout(r, 120));
 
                     const timeToAnswer = this.aiStoppedSpeakingAt > 0 ? Date.now() - this.aiStoppedSpeakingAt : 0;
                     await this._handleTranscript(text, { utteranceDurationMs, fillerWordCount, timeToAnswer, bargedIn: true });
@@ -398,10 +401,20 @@ export class VoicePipelineWorker {
 
         const provider = (process.env.INTERVIEW_TTS_PROVIDER || "polly").toLowerCase();
 
-        // Speech marks for full text (subtitles)
+        // Speech marks for full text (subtitles). For Polly this is a SECOND
+        // API round trip, so it must never gate the audio path — emit whenever
+        // it lands. Subtitles arriving a few hundred ms late is invisible;
+        // audio waiting on them is not.
         const marksPromise = provider === "deepgram"
             ? Promise.resolve(estimateWordTimings(text))
             : getSpeechMarks(text).catch(() => estimateWordTimings(text));
+
+        marksPromise.then(marks => {
+            // Drop late marks if this utterance was already interrupted.
+            if (marks?.length > 0 && this._speechEpoch === myEpoch) {
+                this._emitToRoom('ai_subtitle', { words: marks, text });
+            }
+        }).catch(() => {});
 
         let firstChunk = true;
 
@@ -440,10 +453,8 @@ export class VoicePipelineWorker {
 
             if (firstChunk) {
                 firstChunk = false;
-                const marks = await marksPromise;
-                if (marks.length > 0) {
-                    this._emitToRoom('ai_subtitle', { words: marks, text });
-                }
+                // Subtitles are emitted from marksPromise.then() above — the
+                // first audio chunk is no longer gated on that round trip.
             }
 
             if (!pcm || pcm.length === 0) continue;

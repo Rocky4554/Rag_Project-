@@ -44,6 +44,11 @@ export function createInterviewRoutes({ sessionCache, activeAgents, activeVoiceA
             clearSessionInterviewState(sessionId);
             registerVectorStore(sessionId, session.vectorStore, session.originalName || "");
 
+            // Kick off the resume lookup now — it shares no data with the
+            // profile fetch below, so overlapping the two round trips removes
+            // one of them from the interview-start critical path.
+            const activeRecordPromise = getActiveInterview(sessionId).catch(() => null);
+
             // Fetch cross-session user profile for personalized interview
             let userProfileContext = "";
             if (req.user) {
@@ -91,7 +96,7 @@ export function createInterviewRoutes({ sessionCache, activeAgents, activeVoiceA
             let isResume = false;
             let interviewRunId = `${sessionId}_${Date.now()}`;
 
-            const activeRecord = await getActiveInterview(sessionId).catch(() => null);
+            const activeRecord = await activeRecordPromise;
             if (activeRecord?.thread_id) {
                 // Verify the checkpoint actually exists by reading the state
                 try {

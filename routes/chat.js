@@ -63,8 +63,10 @@ export function createChatRoutes({ sessionCache }) {
 
             // Persist chat messages to Supabase if user is authenticated
             if (req.user && session._documentId) {
-                saveChatMessage({ userId: req.user.id, documentId: session._documentId, role: 'user', content: question });
-                saveChatMessage({ userId: req.user.id, documentId: session._documentId, role: 'ai', content: answer });
+                saveChatMessage({ userId: req.user.id, documentId: session._documentId, role: 'user', content: question })
+                    .catch(err => chatLog.warn({ err: err.message, sessionId }, 'Chat persist failed (user)'));
+                saveChatMessage({ userId: req.user.id, documentId: session._documentId, role: 'ai', content: answer })
+                    .catch(err => chatLog.warn({ err: err.message, sessionId }, 'Chat persist failed (ai)'));
             }
 
             const totalMs = Math.round(performance.now() - routeStart);
@@ -148,8 +150,10 @@ export function createChatRoutes({ sessionCache }) {
             }
 
             if (req.user && session._documentId) {
-                saveChatMessage({ userId: req.user.id, documentId: session._documentId, role: 'user', content: question });
-                saveChatMessage({ userId: req.user.id, documentId: session._documentId, role: 'ai', content: fullAnswer });
+                saveChatMessage({ userId: req.user.id, documentId: session._documentId, role: 'user', content: question })
+                    .catch(err => chatLog.warn({ err: err.message, sessionId }, 'Chat persist failed (user)'));
+                saveChatMessage({ userId: req.user.id, documentId: session._documentId, role: 'ai', content: fullAnswer })
+                    .catch(err => chatLog.warn({ err: err.message, sessionId }, 'Chat persist failed (ai stream)'));
             }
 
             const totalMs = Math.round(performance.now() - routeStart);

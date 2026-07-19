@@ -55,26 +55,32 @@ const clientReadyResolvers = new Map();
 const SESSION_TTL = parseInt(process.env.SESSION_TTL_MS) || 2 * 60 * 60 * 1000; // 2 hours default
 
 setInterval(() => {
-    const now = Date.now();
-    let cleaned = 0;
-    for (const [id, session] of Object.entries(sessionCache)) {
-        if (now - (session.createdAt || 0) > SESSION_TTL) {
-            // Stop active agents if running
-            if (activeAgents.has(id)) {
-                activeAgents.get(id).stop();
-                activeAgents.delete(id);
+    // Wrapped: an throw here is an uncaught exception in a timer callback,
+    // which takes the whole process down.
+    try {
+        const now = Date.now();
+        let cleaned = 0;
+        for (const [id, session] of Object.entries(sessionCache)) {
+            if (now - (session.createdAt || 0) > SESSION_TTL) {
+                // Stop active agents if running
+                if (activeAgents.has(id)) {
+                    activeAgents.get(id).stop();
+                    activeAgents.delete(id);
+                }
+                if (activeConversationalAgents.has(id)) {
+                    activeConversationalAgents.get(id).stop();
+                    activeConversationalAgents.delete(id);
+                }
+                delete sessionCache[id];
+                clearSessionInterviewState(id);
+                cleaned++;
             }
-            if (activeVoiceAgents.has(id)) {
-                activeVoiceAgents.get(id).stop();
-                activeVoiceAgents.delete(id);
-            }
-            delete sessionCache[id];
-            clearSessionInterviewState(id);
-            cleaned++;
         }
-    }
-    if (cleaned > 0) {
-        serverLog.info({ cleaned, remaining: Object.keys(sessionCache).length }, 'Session cleanup');
+        if (cleaned > 0) {
+            serverLog.info({ cleaned, remaining: Object.keys(sessionCache).length }, 'Session cleanup');
+        }
+    } catch (err) {
+        serverLog.error({ err: err.message }, 'Session cleanup failed');
     }
 }, 10 * 60 * 1000); // check every 10 minutes
 
@@ -104,7 +110,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    socket.on('disconnect', () => {
+    socket.on('disconnect', () => { 
         if (socket.data.sessionId) {
             unregisterSocket(socket.data.sessionId);
         }
@@ -242,4 +248,37 @@ async function startServer() {
 startServer().catch(err => {
     serverLog.fatal({ err: err.message }, 'Fatal startup error');
     process.exit(1);
+});
+
+// ── Graceful shutdown ────────────────────────────────────────────
+// Render/Docker send SIGTERM on redeploy. Without this, live agents are
+// killed mid-connection and their LiveKit participants linger server-side,
+// so the next deploy's agent collides with a stale participant of the same
+// identity and its token gets revoked.
+let shuttingDown = false;
+function shutdown(signal) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    serverLog.info({ signal, agents: activeAgents.size + activeConversationalAgents.size }, 'Shutting down, stopping agents');
+
+    for (const [id, agent] of activeAgents) {
+        try { agent.stop(); } catch (err) { serverLog.warn({ id, err: err.message }, 'Agent stop failed'); }
+    }
+    for (const [id, agent] of activeConversationalAgents) {
+        try { agent.stop(); } catch (err) { serverLog.warn({ id, err: err.message }, 'Voice agent stop failed'); }
+    }
+    activeAgents.clear();
+    activeConversationalAgents.clear();
+
+    httpServer.close(() => process.exit(0));
+    // Don't hang forever on lingering sockets
+    setTimeout(() => process.exit(0), 8000).unref();
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
+// A crash in an async callback should be logged, not silently fatal
+process.on('unhandledRejection', (reason) => {
+    serverLog.error({ err: reason?.message || String(reason) }, 'Unhandled promise rejection');
 });

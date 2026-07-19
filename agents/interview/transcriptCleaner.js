@@ -4,6 +4,19 @@ import { agentLog } from "../../lib/logger.js";
 
 dotenv.config();
 
+// Memoized Gemini client. checkSemanticCompleteness runs on the voice hot path
+// (every short answer), and rebuilding the client per call is wasted work.
+let _completenessModel = null;
+function getCompletenessModel(apiKey) {
+    if (!_completenessModel) {
+        const genAI = new GoogleGenerativeAI(apiKey);
+        _completenessModel = genAI.getGenerativeModel({
+            model: process.env.GEMINI_MINI_MODEL || "gemini-3.1-flash-lite",
+        });
+    }
+    return _completenessModel;
+}
+
 /**
  * Synchronous, zero-cost rule-based transcript cleanup.
  *
@@ -72,17 +85,18 @@ export async function checkSemanticCompleteness(text) {
             return true;
         }
 
-        const genAI = new GoogleGenerativeAI(apiKey);
-        const model = genAI.getGenerativeModel({ model: process.env.GEMINI_MINI_MODEL || "gemini-3.1-flash-lite" });
+        const model = getCompletenessModel(apiKey);
 
-        // Race the Gemini call against a 2-second timeout
-        const timeoutPromise = new Promise((_resolve, reject) =>
-            setTimeout(() => reject(new Error("checkSemanticCompleteness: 2s timeout")), 2000)
-        );
+        // Race the Gemini call against a 2-second timeout. The timer is cleared
+        // when the model wins, so it doesn't keep the event loop referenced.
+        let timer;
+        const timeoutPromise = new Promise((_resolve, reject) => {
+            timer = setTimeout(() => reject(new Error("checkSemanticCompleteness: 2s timeout")), 2000);
+        });
 
         const geminiPromise = model.generateContent(prompt);
 
-        const result = await Promise.race([geminiPromise, timeoutPromise]);
+        const result = await Promise.race([geminiPromise, timeoutPromise]).finally(() => clearTimeout(timer));
         const responseText = result.response.text().trim();
 
         // If response contains "NO" (case-insensitive) and not "YES", incomplete
