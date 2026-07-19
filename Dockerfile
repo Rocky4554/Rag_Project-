@@ -9,7 +9,6 @@ RUN apt-get update && \
 # Point native Rust TLS to system CA certs
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 ENV SSL_CERT_DIR=/etc/ssl/certs
-ENV NODE_TLS_REJECT_UNAUTHORIZED=0
 
 WORKDIR /app
 
