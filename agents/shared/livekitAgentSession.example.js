@@ -8,6 +8,7 @@
 import { llm } from '@livekit/agents';
 import { z } from 'zod';
 import { LiveKitAgentSession, generateClientToken } from './livekitAgentSession.js';
+import { toLiveKit } from '../../lib/tools/adapters/livekit.js';
 
 // ═══════════════════════════════════════════════════════════════════
 // EXAMPLE 1: Simple Voice Chat (no tools, no RAG)
@@ -39,21 +40,17 @@ async function example_ragVoiceAgent(sessionId, sessionCache, io) {
 Use the search_pdf tool to find information from the document when needed.
 Keep responses concise — 1 to 3 sentences for voice.`,
         greeting: `Hello! I've loaded your document. Ask me anything about it!`,
-        tools: {
-            search_pdf: llm.tool({
-                description: "Search the user's uploaded PDF document for specific information",
-                parameters: z.object({
-                    query: z.string().describe('Search query to find relevant content in the PDF'),
-                }),
-                execute: async ({ query }) => {
-                    if (!session?.vectorStore) {
-                        return 'No document is currently loaded.';
-                    }
-                    const docs = await session.vectorStore.similaritySearch(query, 3);
-                    return docs.map(d => d.pageContent).join('\n\n') || 'No relevant content found.';
-                },
-            }),
-        },
+        // Tools come from the shared registry (lib/tools/registry.js) — the same
+        // definitions the Gemini Live worker uses. Pass a function so the session
+        // entry is resolved per call, not captured at construction time.
+        // web_search is included here because this session's LLM (OpenAI/Groq via
+        // LiveKit plugins) has no native grounding, unlike the Gemini Live voice
+        // worker, which uses Gemini's built-in googleSearch instead of this tool.
+        tools: toLiveKit(['search_pdf', 'web_search'], () => ({
+            sessionId,
+            session: sessionCache[sessionId],
+            io,
+        })),
     });
 
     await agent.start();

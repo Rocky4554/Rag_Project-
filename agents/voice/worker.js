@@ -11,6 +11,10 @@ import { AccessToken } from 'livekit-server-sdk';
 import { AudioPublisher } from '../shared/audioPublisher.js';
 import { getUserProfileContext } from '../../lib/interview/profileUpdater.js';
 import { agentLog } from '../../lib/logger.js';
+import { toGemini } from '../../lib/tools/adapters/gemini.js';
+
+// Tools this agent exposes, defined once in lib/tools/registry.js
+const voiceTools = toGemini(['search_pdf', 'end_session']);
 
 // Override via GEMINI_LIVE_MODEL env var. Run: node scripts/listLiveModels.js to see options.
 const VOICE_MODEL = process.env.GEMINI_LIVE_MODEL || 'gemini-3.1-flash-live-preview';
@@ -102,29 +106,7 @@ export class VoiceAgentWorker {
                 responseModalities: [Modality.AUDIO],
                 systemInstruction: { parts: [{ text: systemPrompt }] },
                 tools: [
-                    {
-                        functionDeclarations: [
-                            {
-                                name: 'search_pdf',
-                                description: "Search the user's uploaded PDF document for specific information",
-                                parameters: {
-                                    type: 'OBJECT',
-                                    properties: {
-                                        query: { type: 'STRING', description: 'Search query to find relevant content in the PDF' }
-                                    },
-                                    required: ['query']
-                                }
-                            },
-                            {
-                                name: 'end_session',
-                                description: "End the current conversation session and disconnect gracefully when requested by the user.",
-                                parameters: {
-                                    type: 'OBJECT',
-                                    properties: {}
-                                }
-                            }
-                        ]
-                    },
+                    { functionDeclarations: voiceTools.functionDeclarations },
                     { googleSearch: {} }
                 ],
                 // Disable thinking/reasoning to prevent internal monologue in speech
@@ -434,37 +416,19 @@ export class VoiceAgentWorker {
     }
 
     async _handleToolCall(functionCalls) {
-        const session = this.sessionCache[this.sessionId];
-        const responses = [];
-
-        for (const fn of functionCalls) {
-            if (fn.name === 'search_pdf') {
-                agentLog.info({ sessionId: this.sessionId, query: fn.args?.query, type: 'voice' }, 'search_pdf tool called');
-                try {
-                    if (!session?.vectorStore) {
-                        responses.push({ id: fn.id, name: fn.name, response: { output: 'No document is currently loaded.' } });
-                    } else {
-                        const docs = await session.vectorStore.similaritySearch(fn.args.query, 3);
-                        const result = docs.map(d => d.pageContent).join('\n\n') || 'No relevant content found.';
-                        agentLog.info({ sessionId: this.sessionId, resultChars: result.length, preview: result.substring(0, 80), type: 'voice' }, 'search_pdf result');
-                        responses.push({ id: fn.id, name: fn.name, response: { output: result } });
-                    }
-                } catch (err) {
-                    responses.push({ id: fn.id, name: fn.name, response: { output: 'Failed to search the document.' } });
+        const responses = await voiceTools.dispatch(functionCalls, {
+            sessionId: this.sessionId,
+            session: this.sessionCache[this.sessionId],
+            io: this.io,
+            logType: 'voice',
+            // Trigger graceful stop after a tiny delay to allow the response to be processed
+            endSession: () => setTimeout(() => {
+                if (this.io) {
+                    this.io.to(this.sessionId).emit('voice_state', { state: 'disconnected' });
                 }
-            } else if (fn.name === 'end_session') {
-                agentLog.info({ sessionId: this.sessionId, type: 'voice' }, 'end_session tool called');
-                responses.push({ id: fn.id, name: fn.name, response: { output: 'Disconnecting now. Goodbye!' } });
-                
-                // Trigger graceful stop after a tiny delay to allow the response to be processed
-                setTimeout(() => {
-                    if (this.io) {
-                        this.io.to(this.sessionId).emit('voice_state', { state: 'disconnected' });
-                    }
-                    this.stop();
-                }, 1000);
-            }
-        }
+                this.stop();
+            }, 1000),
+        });
 
         if (responses.length > 0 && this.geminiSession) {
             this.geminiSession.sendToolResponse({ functionResponses: responses });
