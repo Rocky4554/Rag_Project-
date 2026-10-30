@@ -12,6 +12,7 @@ import { imageEmbedder } from "../lib/embeddings.js";
 import { optionalAuth } from "../middleware/auth.js";
 import { saveDocument, logActivity } from "../lib/db.js";
 import { uploadLog } from '../lib/logger.js';
+import { publicError } from '../lib/access.js';
 import { Document } from "@langchain/core/documents";
 
 // Qdrant client for direct vector operations (used for image embeddings
@@ -107,6 +108,7 @@ export function createUploadRoutes({ sessionCache, upload }) {
                     chatHistory: [],
                     interviewState: null,
                     createdAt: Date.now(),
+                    ownerId: req.user?.id || null,
                     originalName: req.file.originalname,
                     contentType: 'pdf',
                     hasImages: false,
@@ -192,6 +194,7 @@ export function createUploadRoutes({ sessionCache, upload }) {
                     chatHistory: [],
                     interviewState: null,
                     createdAt: Date.now(),
+                    ownerId: req.user?.id || null,
                     originalName: req.file.originalname,
                     contentType: 'image',
                     hasImages: true,
@@ -231,7 +234,7 @@ export function createUploadRoutes({ sessionCache, upload }) {
         } catch (error) {
             const totalMs = Math.round(performance.now() - totalStart);
             uploadLog.error({ err: error.message, totalMs }, 'Upload error');
-            res.status(500).json({ error: error.message || "Failed to process upload" });
+            res.status(500).json({ error: publicError(error, "Failed to process upload") });
         }
     });
 
@@ -283,6 +286,7 @@ export function createUploadRoutes({ sessionCache, upload }) {
                 chatHistory: [],
                 interviewState: null,
                 createdAt: Date.now(),
+                ownerId: req.user?.id || null,
                 originalName: docTitle,
                 contentType: 'text',
                 hasImages: false,
@@ -321,7 +325,7 @@ export function createUploadRoutes({ sessionCache, upload }) {
         } catch (error) {
             const totalMs = Math.round(performance.now() - totalStart);
             uploadLog.error({ err: error.message, totalMs }, 'Text upload error');
-            res.status(500).json({ error: error.message || "Failed to process text" });
+            res.status(500).json({ error: publicError(error, "Failed to process text") });
         }
     });
 

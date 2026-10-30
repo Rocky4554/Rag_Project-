@@ -6,7 +6,6 @@
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
-    "agent": "node agent/agent.js",
     "tts:cache": "node scripts/generateTTSCache.js"
   },
   "keywords": [],

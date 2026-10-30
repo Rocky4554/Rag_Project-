@@ -1,20 +1,49 @@
 import { Router } from 'express';
 import bcrypt from 'bcryptjs';
 import { supabaseAdmin } from '../lib/supabase.js';
-import { signAccessToken, signRefreshToken, verifyToken, cookieOptions } from '../lib/jwt.js';
+import { signAccessToken, signRefreshToken, verifyRefreshToken, cookieOptions } from '../lib/jwt.js';
 import { sendOTPEmail, generateOTP } from '../lib/email.js';
 import { requireAuth } from '../middleware/auth.js';
 import { getUserDocuments, getRecentActivity } from '../lib/db.js';
 import { validate, authSignupSchema, authLoginSchema, authForgotSchema, authVerifyOtpSchema, authResetPasswordSchema } from '../lib/validation.js';
 import { authLog } from '../lib/logger.js';
+import { passwordVersion, forgetPasswordVersion } from '../lib/passwordVersion.js';
 
 const ACCESS_MAX_AGE = 7 * 24 * 60 * 60 * 1000;   // 7 days
 const REFRESH_MAX_AGE = 30 * 24 * 60 * 60 * 1000;  // 30 days
 
-function setAuthCookies(res, userId, email, name) {
-    const payload = { id: userId, email, name: name || '' };
+// After this many wrong codes, all of the user's outstanding reset codes are invalidated
+const MAX_OTP_FAILURES = 5;
+const otpFailures = new Map(); // userId → failed verification count
+
+async function recordOtpFailure(userId) {
+    const count = (otpFailures.get(userId) || 0) + 1;
+    if (count < MAX_OTP_FAILURES) {
+        otpFailures.set(userId, count);
+        return false;
+    }
+    otpFailures.delete(userId);
+    await supabaseAdmin
+        .from('password_resets')
+        .update({ used: true })
+        .eq('user_id', userId)
+        .eq('used', false);
+    authLog.warn({ userId }, 'Too many wrong reset codes — outstanding codes invalidated');
+    return true;
+}
+
+function otpFailureResponse(res, locked) {
+    return res.status(400).json({
+        error: locked ? 'Too many incorrect attempts. Please request a new code.' : 'Invalid or expired code'
+    });
+}
+
+function setAuthCookies(res, userId, email, name, passwordHash) {
+    // pwv ties tokens to the current password — a reset invalidates them (lib/passwordVersion.js)
+    const pwv = passwordVersion(passwordHash);
+    const payload = { id: userId, email, name: name || '', pwv };
     const accessToken = signAccessToken(payload);
-    const refreshToken = signRefreshToken({ id: userId });
+    const refreshToken = signRefreshToken({ id: userId, pwv });
 
     res.cookie('access_token', accessToken, cookieOptions(ACCESS_MAX_AGE));
     res.cookie('refresh_token', refreshToken, cookieOptions(REFRESH_MAX_AGE));
@@ -51,7 +80,7 @@ export function createAuthRoutes() {
 
             if (error) throw error;
 
-            setAuthCookies(res, user.id, user.email, user.name);
+            setAuthCookies(res, user.id, user.email, user.name, password_hash);
 
             authLog.info({ email }, 'User signed up');
             res.json({ user: { id: user.id, email: user.email, name: user.name } });
@@ -77,7 +106,7 @@ export function createAuthRoutes() {
             const valid = await bcrypt.compare(password, user.password_hash);
             if (!valid) return res.status(401).json({ error: 'Invalid email or password' });
 
-            setAuthCookies(res, user.id, user.email, user.name);
+            setAuthCookies(res, user.id, user.email, user.name, user.password_hash);
 
             authLog.info({ email }, 'User logged in');
             res.json({ user: { id: user.id, email: user.email, name: user.name } });
@@ -93,17 +122,21 @@ export function createAuthRoutes() {
             const token = req.cookies?.refresh_token;
             if (!token) return res.status(401).json({ error: 'No refresh token' });
 
-            const decoded = verifyToken(token);
+            const decoded = verifyRefreshToken(token);
 
             const { data: user } = await supabaseAdmin
                 .from('users')
-                .select('id, email, name')
+                .select('id, email, name, password_hash')
                 .eq('id', decoded.id)
                 .single();
 
             if (!user) return res.status(401).json({ error: 'User not found' });
+            // Refresh token issued before a password reset (or before `pwv` existed)
+            if (!decoded.pwv || decoded.pwv !== passwordVersion(user.password_hash)) {
+                return res.status(401).json({ error: 'Session expired, please log in again' });
+            }
 
-            setAuthCookies(res, user.id, user.email, user.name);
+            setAuthCookies(res, user.id, user.email, user.name, user.password_hash);
             res.json({ user: { id: user.id, email: user.email, name: user.name } });
         } catch (error) {
             authLog.error({ err: error.message }, 'Refresh error');
@@ -151,7 +184,8 @@ export function createAuthRoutes() {
             // Always return success to prevent email enumeration
             if (!user) return res.json({ message: 'If that email exists, a reset code has been sent.' });
 
-            // Invalidate previous OTPs
+            // Invalidate previous OTPs (and start a fresh attempt budget)
+            otpFailures.delete(user.id);
             await supabaseAdmin
                 .from('password_resets')
                 .update({ used: true })
@@ -203,7 +237,7 @@ export function createAuthRoutes() {
                 .limit(1)
                 .single();
 
-            if (!reset) return res.status(400).json({ error: 'Invalid or expired code' });
+            if (!reset) return otpFailureResponse(res, await recordOtpFailure(user.id));
 
             res.json({ valid: true });
         } catch (error) {
@@ -237,14 +271,17 @@ export function createAuthRoutes() {
                 .limit(1)
                 .single();
 
-            if (!reset) return res.status(400).json({ error: 'Invalid or expired code' });
+            if (!reset) return otpFailureResponse(res, await recordOtpFailure(user.id));
+            otpFailures.delete(user.id);
 
-            // Update password
+            // Update password — changes the token fingerprint, logging out existing sessions
             const password_hash = await bcrypt.hash(newPassword, 12);
-            await supabaseAdmin
+            const { error: updateErr } = await supabaseAdmin
                 .from('users')
                 .update({ password_hash })
                 .eq('id', user.id);
+            if (updateErr) throw updateErr;
+            forgetPasswordVersion(user.id);
 
             // Mark OTP as used
             await supabaseAdmin

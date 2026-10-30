@@ -3,6 +3,7 @@ import { optionalAuth, requireAuth } from '../middleware/auth.js';
 import { ensureSession } from '../lib/sessionRestore.js';
 import { getUserDocuments } from '../lib/db.js';
 import { serverLog } from '../lib/logger.js';
+import { canAccessSession } from '../lib/access.js';
 
 export function createSessionRoutes({ sessionCache }) {
     const router = Router();
@@ -20,13 +21,15 @@ export function createSessionRoutes({ sessionCache }) {
             }
 
             // Check if already in memory
-            if (sessionCache[sessionId]?.vectorStore) {
+            const cached = sessionCache[sessionId];
+            if (cached?.vectorStore) {
+                if (!canAccessSession(cached, req.user)) return res.json({ status: 'not_found', sessionId });
                 return res.json({ status: 'active', sessionId });
             }
 
             // Try to restore
             const session = await ensureSession(sessionCache, sessionId);
-            if (session) {
+            if (session && canAccessSession(session, req.user)) {
                 return res.json({ status: 'restored', sessionId });
             }
 
@@ -42,9 +45,10 @@ export function createSessionRoutes({ sessionCache }) {
      * GET /api/session/status/:sessionId
      * Check if a session is active in memory (without restoring).
      */
-    router.get('/session/status/:sessionId', (req, res) => {
+    router.get('/session/status/:sessionId', optionalAuth, (req, res) => {
         const { sessionId } = req.params;
-        const session = sessionCache[sessionId];
+        const cached = sessionCache[sessionId];
+        const session = canAccessSession(cached, req.user) ? cached : null;
 
         res.json({
             sessionId,

@@ -8,6 +8,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { createServer } from 'http';
 import { Server as SocketIOServer } from 'socket.io';
+import { MemorySaver } from '@langchain/langgraph';
 
 import { validateEnv, printEnvStatus } from './lib/env.js';
 import { serverLog, httpLogger } from './lib/logger.js';
@@ -24,6 +25,10 @@ import { createHistoryRoutes } from './routes/history.js';
 import { createSessionRoutes } from './routes/session.js';
 import { createConversationalAiRoutes } from './routes/conversationalAI.js';
 import { cleanupOldBM25Files } from './lib/pipeline/bm25Index.js';
+import { ensureSession } from './lib/sessionRestore.js';
+import { canAccessSession } from './lib/access.js';
+import { verifyAccessToken } from './lib/jwt.js';
+import { isTokenCurrent } from './lib/passwordVersion.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -64,9 +69,9 @@ setInterval(() => {
                 activeAgents.get(id).stop();
                 activeAgents.delete(id);
             }
-            if (activeVoiceAgents.has(id)) {
-                activeVoiceAgents.get(id).stop();
-                activeVoiceAgents.delete(id);
+            if (activeConversationalAgents.has(id)) {
+                activeConversationalAgents.get(id).stop();
+                activeConversationalAgents.delete(id);
             }
             delete sessionCache[id];
             clearSessionInterviewState(id);
@@ -83,16 +88,36 @@ cleanupOldBM25Files(7).catch(() => {}); // run once at startup
 setInterval(() => cleanupOldBM25Files(7).catch(() => {}), 24 * 60 * 60 * 1000); // repeat daily
 
 // ── Socket.io ────────────────────────────────────────────────────
+async function getSocketUser(socket) {
+    const cookies = (socket.handshake.headers.cookie || '').split(';').map(s => s.trim());
+    const raw = cookies.find(c => c.startsWith('access_token='));
+    if (!raw) return null;
+    let decoded;
+    try {
+        decoded = verifyAccessToken(decodeURIComponent(raw.slice('access_token='.length)));
+    } catch {
+        return null;
+    }
+    return (await isTokenCurrent(decoded)) ? { id: decoded.id } : null;
+}
+
 io.on('connection', (socket) => {
     serverLog.debug({ socketId: socket.id }, 'Client connected');
 
-    socket.on('register_session', (sessionId) => {
-        if (sessionId && typeof sessionId === 'string') {
-            socket.join(sessionId);
-            socket.data.sessionId = sessionId;
-            registerSocket(sessionId, socket);
-            serverLog.debug({ socketId: socket.id, sessionId }, 'Session registered');
+    socket.on('register_session', async (sessionId) => {
+        if (!sessionId || typeof sessionId !== 'string') return;
+        // Sessions without a document (e.g. conversational AI) have nothing to protect
+        const session = await ensureSession(sessionCache, sessionId).catch(() => null);
+        if (session && !canAccessSession(session, await getSocketUser(socket))) {
+            serverLog.warn({ socketId: socket.id, sessionId }, 'Session registration refused');
+            // Client refreshes its auth cookie and reconnects
+            socket.emit('register_error', { sessionId });
+            return;
         }
+        socket.join(sessionId);
+        socket.data.sessionId = sessionId;
+        registerSocket(sessionId, socket);
+        serverLog.debug({ socketId: socket.id, sessionId }, 'Session registered');
     });
 
     socket.on('client_audio_ready', (sessionId) => {
@@ -166,17 +191,23 @@ const upload = multer({
     storage: multer.memoryStorage(),
     limits: { fileSize: 20 * 1024 * 1024 }, // 20MB max
     fileFilter: (req, file, cb) => {
-        if (ALLOWED_MIMES.has(file.mimetype)) cb(null, true);
-        else cb(new Error('Unsupported file type. Allowed: PDF, PNG, JPG, WebP, GIF'), false);
+        if (ALLOWED_MIMES.has(file.mimetype)) return cb(null, true);
+        const err = new Error('Unsupported file type. Allowed: PDF, PNG, JPG, WebP, GIF');
+        err.status = 400;
+        cb(err, false);
     }
 });
 
 // ── Global error handler ─────────────────────────────────────────
 function errorHandler(err, req, res, _next) {
     serverLog.error({ err: err.message, path: req.path }, 'Unhandled error');
+    if (err instanceof multer.MulterError) {
+        const status = err.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
+        return res.status(status).json({ error: err.message });
+    }
     const status = err.status || 500;
     res.status(status).json({
-        error: process.env.NODE_ENV === 'production' ? 'Internal server error' : err.message
+        error: status < 500 || process.env.NODE_ENV !== 'production' ? err.message : 'Internal server error'
     });
 }
 
@@ -192,8 +223,9 @@ async function startServer() {
         interviewAgent = await agentFactory();
         serverLog.info({ mode: useDeepAgent ? 'deep' : 'classic' }, 'Interview agent ready (PostgresSaver)');
     } catch (err) {
-        serverLog.warn({ err: err.message }, 'PostgresSaver failed, using no checkpointer');
-        interviewAgent = await agentFactory(null);
+        // In-memory checkpoints keep interview state between turns; lost on restart.
+        serverLog.warn({ err: err.message }, 'PostgresSaver failed, using in-memory checkpointer');
+        interviewAgent = await agentFactory(new MemorySaver());
     }
 
     // ── Routes with rate limiters ────────────────────────────────
@@ -221,7 +253,7 @@ async function startServer() {
     app.use('/api', createConversationalAiRoutes(deps));
 
     app.use('/api', apiLimiter);
-    app.use('/api', createTokenRoutes());
+    app.use('/api', createTokenRoutes(deps));
     app.use('/api', createHistoryRoutes(deps));
     app.use('/api', createSessionRoutes(deps));
 

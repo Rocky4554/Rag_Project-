@@ -38,6 +38,8 @@ export class DeepgramSTT extends EventEmitter {
     }
 
     start() {
+        // A retried start() must not leave the previous socket (and its reconnect loop) alive
+        if (this.socket) this.stop();
         this._stopped = false;
         this._connect();
     }
@@ -85,6 +87,7 @@ export class DeepgramSTT extends EventEmitter {
                 Authorization: `Token ${apiKey}`
             }
         });
+        const socket = this.socket;
 
         this.socket.on("open", () => {
             agentLog.info({ ms: Math.round(Date.now() - (this._connectTs || Date.now())), model: this.model }, 'STT Deepgram WebSocket opened');
@@ -153,10 +156,12 @@ export class DeepgramSTT extends EventEmitter {
             this.isReady = false;
             this._stopKeepalive();
 
-            // Auto-reconnect unless explicitly stopped
-            if (!this._stopped) {
+            // Auto-reconnect unless explicitly stopped or this socket was already replaced
+            if (!this._stopped && this.socket === socket) {
                 agentLog.info('STT reconnecting in 1s');
-                setTimeout(() => this._connect(), 1000);
+                setTimeout(() => {
+                    if (this.socket === socket) this._connect();
+                }, 1000);
             }
         });
 

@@ -5,6 +5,7 @@ import { saveQuizResult, getDocumentBySessionId, logActivity } from "../lib/db.j
 import { ensureSession } from "../lib/sessionRestore.js";
 import { validate, quizSchema } from '../lib/validation.js';
 import { quizLog } from '../lib/logger.js';
+import { canAccessSession, publicError } from '../lib/access.js';
 
 export function createQuizRoutes({ sessionCache }) {
     const router = Router();
@@ -17,7 +18,7 @@ export function createQuizRoutes({ sessionCache }) {
 
             // Try in-memory first, then auto-restore from DB+Qdrant
             const session = await ensureSession(sessionCache, sessionId);
-            if (!session || !session.vectorStore) {
+            if (!session || !session.vectorStore || !canAccessSession(session, req.user)) {
                 return res.status(404).json({ error: 'Session not found or expired. Please upload the PDF again.' });
             }
 
@@ -39,7 +40,7 @@ export function createQuizRoutes({ sessionCache }) {
                             userId: req.user.id,
                             documentId: doc.id,
                             topic: topic || "general",
-                            questions: quizData.questions || quizData,
+                            questions: quizData.quiz || quizData,
                             score: null,
                             totalQuestions: parseInt(numQuestions) || 5
                         });
@@ -65,7 +66,7 @@ export function createQuizRoutes({ sessionCache }) {
         } catch (error) {
             const totalMs = Math.round(performance.now() - routeStart);
             quizLog.error({ err: error.message, totalMs }, 'Quiz generation error');
-            res.status(500).json({ error: error.message || "Failed to generate quiz" });
+            res.status(500).json({ error: publicError(error, "Failed to generate quiz") });
         }
     });
 

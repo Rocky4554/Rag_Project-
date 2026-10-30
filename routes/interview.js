@@ -8,18 +8,20 @@ import { updateUserProfileAfterInterview, getUserProfileContext } from "../lib/i
 import { generateGreeting, generateSimpleGreeting } from "../lib/interview/greetingGenerator.js";
 import { validate, interviewStartSchema } from '../lib/validation.js';
 import { interviewLog } from '../lib/logger.js';
+import { canAccessSession, publicError } from '../lib/access.js';
 import { cleanupSessionAgents } from './conversationalAI.js';
 
 export function createInterviewRoutes({ sessionCache, activeAgents, activeVoiceAgents, clientReadyResolvers, io, interviewAgent }) {
     const router = Router();
 
     router.post('/interview/start', validate(interviewStartSchema), optionalAuth, async (req, res) => {
+        let agent = null;
         try {
             const { sessionId, maxQuestions = 5, timezone } = req.validated;
 
             // Try in-memory first, then auto-restore from DB+Qdrant
             const session = await ensureSession(sessionCache, sessionId);
-            if (!session || !session.vectorStore) {
+            if (!session || !session.vectorStore || !canAccessSession(session, req.user)) {
                 return res.status(404).json({ error: 'Please upload a PDF or text document first.' });
             }
             if (session.contentType === 'image') {
@@ -42,7 +44,7 @@ export function createInterviewRoutes({ sessionCache, activeAgents, activeVoiceA
 
             // Purge any stale RAG cache / vectorStore from a previous interview on this session
             clearSessionInterviewState(sessionId);
-            registerVectorStore(sessionId, session.vectorStore, session.originalName || "");
+            registerVectorStore(sessionId, session.vectorStore, session.originalName || "", session.bm25Index || null);
 
             // Fetch cross-session user profile for personalized interview
             let userProfileContext = "";
@@ -118,7 +120,7 @@ export function createInterviewRoutes({ sessionCache, activeAgents, activeVoiceA
             // Clean up ALL existing agents on this session before starting a new one
             await cleanupSessionAgents(sessionId, { activeAgents, activeVoiceAgents });
 
-            const agent = new InterviewAgentWorker(
+            agent = new InterviewAgentWorker(
                 sessionId, sessionCache, interviewAgent, io,
                 initialState.candidateName,
                 initialState.maxQuestions
@@ -163,6 +165,8 @@ export function createInterviewRoutes({ sessionCache, activeAgents, activeVoiceA
             const agentStartPromise = agent.start().catch(err => {
                 interviewLog.error({ err: err.message, sessionId }, 'Agent LiveKit connection failed');
                 setTimeout(() => {
+                    // Don't revive an agent that was stopped or replaced in the meantime
+                    if (activeAgents.get(sessionId) !== agent) return;
                     agent.start().catch(err2 => {
                         interviewLog.error({ err: err2.message, sessionId }, 'Agent LiveKit retry failed');
                     });
@@ -233,7 +237,44 @@ export function createInterviewRoutes({ sessionCache, activeAgents, activeVoiceA
 
         } catch (error) {
             interviewLog.error({ err: error.message }, 'Interview start error');
-            res.status(500).json({ error: error.message || "Failed to start interview" });
+            // Don't leave a LiveKit-connected agent behind when the graph failed to start
+            if (agent) {
+                const { sessionId } = req.validated;
+                if (activeAgents.get(sessionId) === agent) activeAgents.delete(sessionId);
+                try { agent.stop(); } catch { /* already stopped */ }
+            }
+            res.status(500).json({ error: publicError(error, "Failed to start interview") });
+        }
+    });
+
+    // POST /api/interview/stop — { sessionId, generateReport = true }
+    // generateReport: end via the graph so the report is produced and `interview_done` emitted.
+    // generateReport=false: client abandoned the page — just shut the agent down; the
+    // checkpoint and active_interviews record stay, so the interview can be resumed.
+    router.post('/interview/stop', optionalAuth, async (req, res) => {
+        try {
+            const { sessionId, generateReport = true } = req.body || {};
+            if (!sessionId || typeof sessionId !== 'string') return res.status(400).json({ error: 'sessionId is required' });
+            if (!canAccessSession(sessionCache[sessionId], req.user)) {
+                return res.status(404).json({ error: 'Session not found' });
+            }
+
+            const agent = activeAgents.get(sessionId);
+            if (!agent) return res.json({ stopped: false });
+
+            if (generateReport && agent.isActive) {
+                agent.requestEnd().catch(err => interviewLog.error({ sessionId, err: err.message }, 'requestEnd error'));
+                interviewLog.info({ sessionId }, 'Interview end requested by client');
+                return res.json({ stopped: true, reportPending: true });
+            }
+
+            activeAgents.delete(sessionId);
+            agent.stop();
+            interviewLog.info({ sessionId }, 'Interview agent stopped by client (resumable)');
+            res.json({ stopped: true, reportPending: false });
+        } catch (error) {
+            interviewLog.error({ err: error.message }, 'Interview stop error');
+            res.status(500).json({ error: publicError(error, 'Failed to stop interview') });
         }
     });
 

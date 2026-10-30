@@ -25,6 +25,11 @@ import { DeepgramSTT } from "../interview/stt.js";
 import { AudioPublisher } from "./audioPublisher.js";
 import { generatePCM, generatePCMPipelined, getSpeechMarks, estimateWordTimings } from "../interview/tts.js";
 import { agentLog } from "../../lib/logger.js";
+import { AsyncLocalStorage } from "node:async_hooks";
+
+// Carries the current turn through every await of its handler, so speech
+// started by that turn can tell it was cancelled by a barge-in.
+const turnContext = new AsyncLocalStorage();
 
 dotenv.config();
 
@@ -86,20 +91,100 @@ export class VoicePipelineWorker {
 
         // Incremented on every barge-in. Each _speakAndEmit captures the epoch
         // at start and bails the moment it changes — so an interrupt cancels the
-        // WHOLE remaining response, not just the single PCM chunk in flight.
+        // in-flight utterance, not just the single PCM chunk.
         this._speechEpoch = 0;
+
+        // Turns run one at a time so two LangGraph invokes never race on the
+        // same thread_id. The running turn is tracked so a barge-in can cancel
+        // everything it still has left to say (e.g. the question after feedback).
+        this._turnQueue = Promise.resolve();
+        this._currentTurn = null;
     }
 
-    /** Cancel all in-flight TTS playback. Bumps the epoch so any running
-     *  _speakAndEmit loop breaks, and halts the current audio chunk. */
+    /** Cancel all in-flight TTS playback: bumps the epoch so any running
+     *  _speakAndEmit loop breaks, cancels the rest of the current turn's
+     *  speech, and halts the current audio chunk. */
     _interruptSpeech() {
         this._speechEpoch++;
+        if (this._currentTurn) this._currentTurn.cancelled = true;
         this.audioPublisher.stop();
+    }
+
+    /** True when the turn this code runs in was cancelled by a barge-in. */
+    _turnCancelled() {
+        return !!turnContext.getStore()?.cancelled;
+    }
+
+    /** Queue a user utterance; it runs after any turn still in progress. */
+    _enqueueTurn(transcript, acousticMeta) {
+        return this._enqueueTask(() => this._handleTranscript(transcript, acousticMeta));
+    }
+
+    /**
+     * Run `fn` as a turn: after the previous turn, inside its own turn context
+     * (so a barge-in can cancel its speech), guarded by the safety timeout.
+     * @param {boolean} [opts.requireActive] - skip if the agent was stopped (false for the intro,
+     *                                         which may be queued while LiveKit is still connecting)
+     */
+    _enqueueTask(fn, { requireActive = true } = {}) {
+        const turn = { cancelled: false, timedOut: false };
+        this._turnQueue = this._turnQueue.then(async () => {
+            if (requireActive && !this.isActive) return;
+            this._currentTurn = turn;
+            let timer;
+            const timeout = new Promise(resolve => {
+                const arm = (ms) => {
+                    timer = setTimeout(() => {
+                        // Audio still playing means the turn is progressing, not hung
+                        if (this.audioPublisher.isSpeaking) return arm(5000);
+                        agentLog.warn({ sessionId: this.sessionId }, 'Turn safety timeout — abandoning turn');
+                        // Silence whatever the stalled turn says later, and reopen the mic:
+                        // audio isn't forwarded to STT while processingTurn is set.
+                        turn.cancelled = true;
+                        turn.timedOut = true;
+                        this.processingTurn = false;
+                        this._emitToRoom('ai_state', { state: 'listening', text: 'Listening...' });
+                        resolve();
+                    }, ms);
+                };
+                arm(this.safetyTimeoutMs);
+            });
+            try {
+                await Promise.race([turnContext.run(turn, fn), timeout]);
+            } finally {
+                clearTimeout(timer);
+                if (this._currentTurn === turn) this._currentTurn = null;
+            }
+        });
+        return this._turnQueue;
+    }
+
+    /** Re-enable speech for the current turn after a barge-in cancelled it
+     *  (e.g. the intro was interrupted, but the first question must still be heard). */
+    _resumeTurnSpeech() {
+        const turn = turnContext.getStore();
+        if (turn && !turn.timedOut) turn.cancelled = false;
+    }
+
+    /** Clear processingTurn at the end of a turn — unless the safety timeout already
+     *  abandoned it, in which case a newer turn may own the flag by now. */
+    _endProcessing() {
+        if (!turnContext.getStore()?.timedOut) this.processingTurn = false;
     }
 
     // ── Lifecycle ───────────────────────────────────────────────
 
     async start() {
+        try {
+            await this._startPipeline();
+        } catch (err) {
+            // Don't leave the Deepgram socket open when LiveKit connect/publish fails
+            this.stt.stop();
+            throw err;
+        }
+    }
+
+    async _startPipeline() {
         const startTs = performance.now();
         agentLog.info({ sessionId: this.sessionId }, 'VoicePipeline starting');
 
@@ -194,6 +279,9 @@ export class VoicePipelineWorker {
         // (headphones / client AEC). The transcript-confirmed barge-in below is
         // the robust default: it only fires on actual transcribed words.
         // Opt in with VAD_INSTANT_BARGE_IN=true once echo is under control.
+        // STT outlives room reconnects — bind its listeners only once or transcripts get handled twice.
+        if (this._sttEventsBound) return;
+        this._sttEventsBound = true;
         this.stt.on("speechStarted", () => {
             if (process.env.VAD_INSTANT_BARGE_IN === 'true' && this.audioPublisher.isSpeaking) {
                 agentLog.info({ sessionId: this.sessionId }, 'VAD speechStarted — instant barge-in, stopping TTS');
@@ -215,17 +303,19 @@ export class VoicePipelineWorker {
                     await new Promise(r => setTimeout(r, 120));
 
                     const timeToAnswer = this.aiStoppedSpeakingAt > 0 ? Date.now() - this.aiStoppedSpeakingAt : 0;
-                    await this._handleTranscript(text, { utteranceDurationMs, fillerWordCount, timeToAnswer, bargedIn: true });
+                    // Queued: runs once the interrupted turn has unwound
+                    await this._enqueueTurn(text, { utteranceDurationMs, fillerWordCount, timeToAnswer, bargedIn: true });
                 } else {
                     agentLog.debug({ sessionId: this.sessionId, wordCount }, 'Ignored short transcript during AI speech');
                 }
                 return;
             }
 
-            if (this.processingTurn) return;
+            // Mid-turn speech is ignored, unless that turn was just interrupted (VAD barge-in)
+            if (this.processingTurn && !this._currentTurn?.cancelled) return;
 
             const timeToAnswer = this.aiStoppedSpeakingAt > 0 ? Date.now() - this.aiStoppedSpeakingAt : 0;
-            await this._handleTranscript(text, { utteranceDurationMs, fillerWordCount, timeToAnswer, bargedIn: false });
+            await this._enqueueTurn(text, { utteranceDurationMs, fillerWordCount, timeToAnswer, bargedIn: false });
         });
     }
 
@@ -268,13 +358,6 @@ export class VoicePipelineWorker {
         const turnStart = performance.now();
         this.processingTurn = true;
 
-        const safetyTimer = setTimeout(() => {
-            if (this.processingTurn) {
-                agentLog.warn({ sessionId: this.sessionId }, 'Turn safety timeout — resetting');
-                this.processingTurn = false;
-            }
-        }, this.safetyTimeoutMs);
-
         agentLog.info({
             sessionId: this.sessionId,
             transcript: transcript.substring(0, 150),
@@ -284,7 +367,8 @@ export class VoicePipelineWorker {
 
         // Notify UI
         this._emitToRoom('ai_state', { state: 'thinking', text: 'Processing...' });
-        this._emitToRoom('transcript_final', { role: 'user', text: transcript });
+        // System turns (e.g. the End button) weren't spoken by the user — don't show them as speech
+        if (!acousticMeta?.system) this._emitToRoom('transcript_final', { role: 'user', text: transcript });
 
         try {
             // Call the subclass implementation
@@ -333,9 +417,18 @@ export class VoicePipelineWorker {
 
         } catch (err) {
             agentLog.error({ sessionId: this.sessionId, err: err.message }, 'Turn error');
+            // Don't leave the UI on "Processing…" in silence — apologise and listen again
+            try {
+                if (!this._turnCancelled()) {
+                    this._emitToRoom('ai_state', { state: 'speaking', text: 'Speaking...' });
+                    await this._speakAndEmit("Sorry, I had trouble processing that. Could you say it again?");
+                }
+            } catch (speakErr) {
+                agentLog.error({ sessionId: this.sessionId, err: speakErr.message }, 'Turn error fallback speech failed');
+            }
+            this._emitToRoom('ai_state', { state: 'listening', text: 'Listening...' });
         } finally {
-            clearTimeout(safetyTimer);
-            this.processingTurn = false;
+            this._endProcessing();
         }
     }
 
@@ -377,6 +470,9 @@ export class VoicePipelineWorker {
      */
     async _speakAndEmit(text, emitStart = true, emitEnd = true) {
         if (!text) return;
+        // A barge-in cancels the rest of this turn — e.g. the question queued after the feedback
+        const turn = turnContext.getStore();
+        if (turn?.cancelled) return;
         // Capture the epoch at the start. A barge-in bumps this._speechEpoch,
         // and every loop iteration below bails the instant it no longer matches.
         const myEpoch = this._speechEpoch;
@@ -418,7 +514,7 @@ export class VoicePipelineWorker {
         // continuously, which is smooth. Splitting per-sentence would add the
         // provider's first-chunk latency (~900ms) as a gap between sentences.
         for await (const { pcm, text: chunkText } of generatePCMPipelined(text, String(this.sampleRate))) {
-            if (this._speechEpoch !== myEpoch) break;
+            if (this._speechEpoch !== myEpoch || turn?.cancelled) break;
 
             if (chunkText) {
                 this._emitToRoom('ai_speech', { action: 'sentence', text: chunkText });

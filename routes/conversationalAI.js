@@ -4,6 +4,7 @@ import { VoiceAgentWorker } from '../agents/voice/worker.js';
 import { optionalAuth } from '../middleware/auth.js';
 import { ensureSession } from '../lib/sessionRestore.js';
 import { agentLog } from '../lib/logger.js';
+import { canAccessSession, publicError } from '../lib/access.js';
 
 // LiveKit Room Service client for server-side room/participant management
 const roomService = (process.env.LIVEKIT_URL && process.env.LIVEKIT_API_KEY && process.env.LIVEKIT_API_SECRET)
@@ -74,7 +75,10 @@ export function createConversationalAiRoutes({ sessionCache, activeAgents, activ
             if (!livekitUrl) return res.status(500).json({ error: 'LiveKit not configured' });
 
             // Try to restore session (for PDF context), but allow voice agent without a document
-            await ensureSession(sessionCache, sessionId).catch(() => {});
+            const session = await ensureSession(sessionCache, sessionId).catch(() => null);
+            if (session && !canAccessSession(session, req.user)) {
+                return res.status(404).json({ error: 'Session not found' });
+            }
 
             agentLog.info({ sessionId, userId: req.user?.id, type: 'voice' }, 'Conversational AI start requested');
 
@@ -117,7 +121,7 @@ export function createConversationalAiRoutes({ sessionCache, activeAgents, activ
 
         } catch (error) {
             agentLog.error({ err: error.message, type: 'voice' }, 'Voice agent start error');
-            res.status(500).json({ error: error.message || 'Failed to start Conversational AI' });
+            res.status(500).json({ error: publicError(error, 'Failed to start Conversational AI') });
         }
     });
 
@@ -126,6 +130,9 @@ export function createConversationalAiRoutes({ sessionCache, activeAgents, activ
         try {
             const { sessionId } = req.body;
             if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
+            if (!canAccessSession(sessionCache[sessionId], req.user)) {
+                return res.status(404).json({ error: 'Session not found' });
+            }
 
             if (activeVoiceAgents.has(sessionId)) {
                 activeVoiceAgents.get(sessionId).stop();
@@ -141,7 +148,7 @@ export function createConversationalAiRoutes({ sessionCache, activeAgents, activ
             res.json({ stopped: true });
         } catch (error) {
             agentLog.error({ err: error.message, type: 'voice' }, 'Voice agent stop error');
-            res.status(500).json({ error: error.message || 'Failed to stop voice agent' });
+            res.status(500).json({ error: publicError(error, 'Failed to stop voice agent') });
         }
     });
 

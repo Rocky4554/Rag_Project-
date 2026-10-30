@@ -1,15 +1,23 @@
 import { Router } from 'express';
 import { AccessToken } from 'livekit-server-sdk';
+import { optionalAuth } from '../middleware/auth.js';
+import { ensureSession } from '../lib/sessionRestore.js';
+import { canAccessSession, publicError } from '../lib/access.js';
 import { serverLog } from '../lib/logger.js';
 
-export function createTokenRoutes() {
+export function createTokenRoutes({ sessionCache }) {
     const router = Router();
 
     // LiveKit token
-    router.post('/livekit/token', async (req, res) => {
+    router.post('/livekit/token', optionalAuth, async (req, res) => {
         try {
             const { sessionId } = req.body;
             if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
+
+            const session = await ensureSession(sessionCache, sessionId);
+            if (!session || !canAccessSession(session, req.user)) {
+                return res.status(404).json({ error: 'Session not found' });
+            }
 
             const apiKey    = process.env.LIVEKIT_API_KEY;
             const apiSecret = process.env.LIVEKIT_API_SECRET;
@@ -38,40 +46,7 @@ export function createTokenRoutes() {
 
         } catch (error) {
             serverLog.error({ err: error.message }, 'LiveKit token generation error');
-            res.status(500).json({ error: error.message || 'Failed to generate LiveKit token' });
-        }
-    });
-
-    // Deepgram token
-    router.get('/deepgram/token', async (req, res) => {
-        try {
-            const apiKey = process.env.DEEPGRAM_API_KEY;
-            if (!apiKey) {
-                return res.status(500).json({ error: 'DEEPGRAM_API_KEY not configured' });
-            }
-
-            const model = process.env.DEEPGRAM_STT_MODEL || 'nova-3';
-            const language = process.env.DEEPGRAM_STT_LANGUAGE || 'en';
-            const smartFormat = (process.env.DEEPGRAM_STT_SMART_FORMAT || 'true').toLowerCase() === 'true';
-            const interimResults = (process.env.DEEPGRAM_STT_INTERIM_RESULTS || 'true').toLowerCase() === 'true';
-            const endpointing = parseInt(process.env.DEEPGRAM_STT_ENDPOINTING_MS || '500', 10);
-
-            res.json({
-                token: apiKey,
-                stt: {
-                    model,
-                    language,
-                    smart_format: smartFormat,
-                    interim_results: interimResults,
-                    endpointing: Number.isFinite(endpointing) ? endpointing : 500,
-                    encoding: 'linear16',
-                    sample_rate: 16000,
-                    channels: 1
-                }
-            });
-        } catch (error) {
-            serverLog.error({ err: error.message }, 'Deepgram token generation error');
-            res.status(500).json({ error: 'Failed to retrieve Deepgram token' });
+            res.status(500).json({ error: publicError(error, 'Failed to generate LiveKit token') });
         }
     });
 

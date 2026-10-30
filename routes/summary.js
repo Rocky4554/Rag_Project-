@@ -6,6 +6,7 @@ import { logActivity } from "../lib/db.js";
 import { ensureSession } from "../lib/sessionRestore.js";
 import { validate, summarySchema } from '../lib/validation.js';
 import { summaryLog } from '../lib/logger.js';
+import { canAccessSession, publicError } from '../lib/access.js';
 
 export function createSummaryRoutes({ sessionCache }) {
     const router = Router();
@@ -18,7 +19,7 @@ export function createSummaryRoutes({ sessionCache }) {
 
             // Try in-memory first, then auto-restore from DB+Qdrant
             const session = await ensureSession(sessionCache, sessionId);
-            if (!session) {
+            if (!session || !canAccessSession(session, req.user)) {
                 return res.status(404).json({ error: 'Session not found or expired. Please upload the PDF again.' });
             }
 
@@ -66,7 +67,7 @@ export function createSummaryRoutes({ sessionCache }) {
         } catch (error) {
             const totalMs = Math.round(performance.now() - routeStart);
             summaryLog.error({ err: error.message, totalMs }, 'Summary/TTS error');
-            res.status(500).json({ error: error.message || "Failed to generate summary or audio" });
+            res.status(500).json({ error: publicError(error, "Failed to generate summary or audio") });
         }
     });
 

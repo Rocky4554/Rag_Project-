@@ -4,155 +4,79 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-RAG-powered AI Voice Interview Platform. Users upload PDFs, the system builds a vector store, then conducts adaptive voice interviews over WebRTC using a LangGraph state machine.
+RAG-powered AI learning + voice interview platform. Users upload a PDF, image, or pasted text; the system builds a Qdrant vector store + BM25 index, then offers chat, summary (with audio), quizzes, and an adaptive voice interview over LiveKit driven by a LangGraph state machine. The Next.js UI lives in the sibling `rag_frontend/` repo; `public/index.html` is an older single-file UI.
 
 ## Commands
 
 ```bash
-# Start the server (Express + Socket.io on PORT=3000)
-node server.js
-
-# Run CLI entry point
-node index.js
-
-# Start LiveKit voice agent worker
-node agent/agent.js
+node server.js          # Express + Socket.io (PORT, default 3000)
+npm run dev             # same, with nodemon
+npm run tts:cache       # regenerate cached TTS phrase MP3s (assets/tts/)
 ```
 
-There are no build steps, linting, or test commands configured.
+Voice agents are not separate processes — routes start them in-process (`agents/*/worker.js`). There are no build, lint, or test commands.
 
 ## Project Structure
 
 ```
-server.js                         # Express app setup, Socket.io, route mounting
-index.js                          # CLI entry point
-
-routes/
-  auth.js                         # POST /api/auth/signup, login, refresh, GET profile
-  upload.js                       # POST /api/upload
-  chat.js                         # POST /api/chat, GET /api/chat/history/:sessionId
-  quiz.js                         # POST /api/quiz
-  summary.js                      # POST /api/summary
-  interview.js                    # POST /api/interview/start
-  tokens.js                       # POST /api/livekit/token, GET /api/deepgram/token
-  history.js                      # GET /api/history/documents, interviews, quizzes, activity
-
-middleware/
-  auth.js                         # requireAuth + optionalAuth (Supabase JWT)
-
+server.js                  # Express setup, Socket.io, rate limiters, route mounting, session TTL cleanup
+routes/                    # Each exports a factory receiving shared deps → Express Router
+  auth.js                  # signup, login, refresh, logout, profile, forgot-password / verify-otp / reset-password
+  upload.js                # POST /upload (PDF or image), POST /upload/text
+  chat.js                  # POST /chat, POST /chat/stream (SSE), GET /chat/history/:sessionId
+  quiz.js, summary.js
+  interview.js             # POST /interview/start, POST /interview/stop
+  conversationalAI.js      # POST /conversational-ai/start|stop (Gemini Live voice agent)
+  tokens.js                # POST /livekit/token
+  history.js               # documents (list/delete), interviews, quizzes, activity
+  session.js               # session restore / status / user-sessions
+middleware/auth.js         # requireAuth / optionalAuth (JWT cookie)
 lib/
-  supabase.js                     # Supabase client (admin + per-user factory)
-  db.js                           # DB helpers (documents, chat, interviews, quizzes, activity)
-  llm.js                          # LLM factory with fallback chain (cross-cutting)
-  embeddings.js                   # Gemini embedding model (cross-cutting)
-  pipeline/                       # Document processing chain
-    pdfLoader.js                  # PDF text extraction
-    textSplitter.js               # Text chunking
-    vectorStore.js                # Qdrant + embedding cache
-    rag.js                        # RAG query logic
-  interview/                      # Interview engine
-    interviewAgent.js             # LangGraph state machine (8 nodes)
-    quizGenerator.js              # Quiz generation from vector store
-    summarizer.js                 # Document summarization
-  tts/                            # Text-to-speech
-    index.js                      # Provider registry
-    speechToAudio.js              # Re-export (entry point for app code)
-    providers/
-      pollyProvider.js
-      kokoroProvider.js
-
-agent/                            # LiveKit voice agent worker
-  agent.js                        # InterviewAgentWorker (main worker)
-  audioPublisher.js               # Pushes PCM frames to LiveKit
-  sessionBridge.js                # Bridges audio events to LangGraph
-  stt.js                          # Deepgram STT via WebSocket
-  tts.js                          # AWS Polly TTS (PCM for LiveKit)
-
-scripts/                          # Utility & test scripts
-public/                           # Frontend (single-file app)
-assets/tts/                       # Cached TTS phrase MP3s
-dev_docs/                         # Developer documentation
-supabase/
-  schema.sql                      # SQL migration for all Supabase tables + RLS
+  access.js                # canAccessSession (ownership), publicError (hide internals in prod)
+  jwt.js                   # access/refresh tokens with a `type` claim
+  passwordVersion.js       # `pwv` token claim — password reset invalidates old tokens
+  llm.js                   # createLLMWithFallback: Gemini or Groq primary → OpenRouter Llama fallback
+  embeddings.js            # Gemini text embeddings + Jina CLIP image embedder
+  sessionRestore.js        # ensureSession: in-memory cache → restore from Supabase + Qdrant + BM25 file
+  db.js, supabase.js, email.js, env.js, logger.js, validation.js (zod 4 — use `.issues`)
+  pipeline/                # pdfLoader, textSplitter, vectorStore, bm25Index, hybridRetrieval, reranker,
+                           # rag, queryRouter, imageChat
+  interview/               # interviewAgent (classic LangGraph), deepInterviewAgent, quizGenerator,
+                           # summarizer, greetingGenerator, profileUpdater
+  tts/                     # provider registry; app code imports lib/tts/speechToAudio.js
+agents/
+  shared/voicePipelineWorker.js  # base: LiveKit room + Deepgram STT + TTS, turn queue, barge-in
+  shared/audioPublisher.js
+  interview/               # InterviewAgentWorker, sessionBridge (→ LangGraph), stt, tts, transcriptCleaner
+  voice/worker.js          # VoiceAgentWorker (Gemini Live, conversational AI)
+supabase/                  # SQL migrations
 ```
 
 ## Architecture
 
-### Core Pipeline
+### Ingestion
+PDF → pdf-parse (per page) → RecursiveCharacterTextSplitter (1500 chars, 200 overlap) → drop low-value + duplicate chunks → Gemini embeddings (batched, retried, SHA256 chunk cache in `.cache/embedding-cache.json`, LRU-capped by `EMBEDDING_CACHE_MAX_ENTRIES`) → Qdrant collection named after the sessionId. Chunks that fail to embed are dropped, never stored as zero vectors. A BM25 (minisearch) index is kept in memory and persisted to `.cache/bm25/`.
 
-```
-PDF Upload → text extraction (pdf-parse) → chunking (900 chars, 150 overlap)
-  → deduplicate → embed (Gemini gemini-embedding-001, batched/cached)
-  → store in Qdrant (per-session collections)
-```
+### Chat
+`queryRouter` classifies DIRECT vs RAG (one-word LLM reply) **concurrently** with hybrid retrieval; DIRECT streams a general-knowledge answer, RAG answers from the retrieved docs. Hybrid retrieval (`hybridRetrieval.js`): BM25 + semantic (50 each) → Reciprocal Rank Fusion → Jina reranker → top 10. Without a BM25 index (e.g. restored session, missing file) it is semantic + rerank only.
 
-### LLM Fallback Chain
+### Interview (LangGraph, `lib/interview/interviewAgent.js`)
+Nodes: planCurriculum, routerNode (intent), gradeAnswer, backchannel, handleEdgeCase, prefetchContext + adaptDifficulty (parallel), updateSummary, generateQuestion, generateFinalReport. `INTERVIEW_AGENT_MODE=deep` swaps in `deepInterviewAgent.js` (LLM orchestrator). Both use `getContext()` → the same hybrid retrieval as chat. Router regex fast-paths only match when the whole utterance is the phrase; everything else goes to the LLM classifier. A grade that can't be parsed after one retry is marked `ungraded` and excluded from scores. Checkpoints: PostgresSaver (Supabase), falling back to MemorySaver if Postgres is unavailable.
 
-Groq (llama-3.3-70b) → OpenRouter (llama-3.3-70b) → Gemini (gemini-2.5-flash). Factory in `lib/llm.js`.
+### Voice path
+Browser mic → LiveKit → `VoicePipelineWorker` → Deepgram STT → `InterviewAgentWorker.onUserTranscript` → `SessionBridge` → LangGraph → TTS (Polly / Deepgram / ElevenLabs via `INTERVIEW_TTS_PROVIDER`) → `AudioPublisher` → LiveKit. Turns are processed one at a time (`_enqueueTurn`); a barge-in cancels the rest of the current turn's speech via an AsyncLocalStorage turn context. Fragments that look cut off are held and merged with the next utterance (or processed after 3s). `POST /interview/stop` ends via a system "stop" turn so the final report is still produced.
 
-### LangGraph Interview State Machine (`lib/interview/interviewAgent.js`)
+### Auth & access
+Custom auth (bcrypt + JWT in httpOnly cookies; `JWT_SECRET` required). `optionalAuth` returns 401 for a present-but-invalid cookie so clients refresh. A session uploaded while logged in has `ownerId` and is only usable by that user (`canAccessSession`) — enforced on all session routes, the LiveKit token, and the Socket.io `register_session` (which emits `register_error` when refused). Anonymous uploads are reachable by sessionId alone.
 
-8-node graph: `planCurriculum → processAnswer → handleEdgeCase → prefetchContext + adaptDifficulty (parallel) → updateSummary → generateQuestion → generateFinalReport`. State has ~20 channels tracking curriculum, scores, difficulty, follow-ups, and struggle streaks.
+### State
+In-memory `sessionCache`, `activeAgents`, interview registries — the server is single-instance by design. Persistent: Supabase (users, documents, chat_messages, interview_results, quiz_results, activities, active_interviews, password_resets, user_profiles), Qdrant (vectors), LangSmith (traces).
 
-### Real-Time Voice Path
-
-```
-Browser mic → LiveKit WebRTC → agent/agent.js (InterviewAgentWorker)
-  → agent/stt.js (Deepgram nova-3 via WebSocket) → transcript
-  → agent/sessionBridge.js → LangGraph state machine
-  → LLM generates response → agent/tts.js (Polly PCM)
-  → agent/audioPublisher.js (10ms PCM chunks) → LiveKit → browser audio
-```
-
-### Key Modules
-
-- **`server.js`** — Express app setup, Socket.io events, mounts route files. Async `startServer()` initializes PostgresSaver checkpointer before mounting routes. Holds in-memory `sessionCache` (vectorStore, docs) with persistent data in Supabase.
-- **`routes/`** — Each file exports a factory function receiving shared deps (sessionCache, io, etc.) and returning an Express Router.
-- **`lib/pipeline/rag.js`** — RAG query: prepends last 3 chat pairs, retrieves top 3 chunks from Qdrant, invokes LLM.
-- **`lib/pipeline/vectorStore.js`** — Qdrant integration with SHA256-based embedding cache (`.cache/embedding-cache.json`). Batches of 20, 250ms inter-batch delay, 3 retries with backoff.
-- **`lib/tts/index.js`** — Provider registry. `TTS_PROVIDER` env var selects polly or kokoro. App code imports from `lib/tts/speechToAudio.js`.
-- **`agent/`** — LiveKit worker components. `agent.js` is the main worker; `sessionBridge.js` bridges real-time audio events to the LangGraph graph.
-
-### Persistence Layer
-
-- **Supabase PostgreSQL** — users (auth), documents, chat_messages, interview_results, quiz_results, activities
-- **LangGraph PostgresSaver** — interview agent checkpoints (auto-managed tables in same Supabase DB)
-- **Qdrant** — vector embeddings only
-- **LangSmith** — traces all LangGraph invocations with thread_id for observability
-
-### API Endpoints
-
-**Auth:**
-- `POST /api/auth/signup` — Create account (email + password)
-- `POST /api/auth/login` — Login, returns JWT session
-- `POST /api/auth/refresh` — Refresh JWT token
-- `GET /api/auth/profile` — User profile + documents + recent activity (auth required)
-
-**Core:**
-- `POST /api/upload` — Upload & process PDF, returns sessionId
-- `POST /api/chat` — RAG query with chat history
-- `GET /api/chat/history/:sessionId` — Retrieve persisted chat history (auth required)
-- `POST /api/quiz` — Generate quiz from document
-- `POST /api/summary` — Summarize document + generate audio
-- `POST /api/interview/start` — Initialize LangGraph interview
-- `POST /api/livekit/token` — WebRTC access token
-- `GET /api/deepgram/token` — STT config for client
-
-**History (auth required):**
-- `GET /api/history/documents` — All user's uploaded documents
-- `GET /api/history/interviews` — Interview results (optional ?documentId filter)
-- `GET /api/history/quizzes` — Quiz results (optional ?documentId filter)
-- `GET /api/history/activity` — User activity log
-
-### Socket.io Events
-
-- `register_session` — Client subscribes to session updates
-- `transcript_final` / `ai_feedback` / `interview_done` — Server pushes interview state to UI
-
-### Frontend (`public/index.html`)
-
-Single-file app with tabbed UI: Upload, Config, Summary, Chat, Interview (setup/active/report), Quiz, Results. Uses Socket.io client and LiveKit browser SDK (`livekit-client.umd.min.js`).
+### Socket.io events
+Client → server: `register_session`, `client_audio_ready`. Server → client: `register_error`, `ai_state`, `transcript_final`, `ai_speech`, `ai_subtitle`, `ai_feedback`, `interview_done`, `voice_error`.
 
 ## Environment Variables
 
-See `.env.example`. Required keys: `GEMINI_API_KEY`, `GROQ_API_KEY`, `QDRANT_URL`, `QDRANT_API_KEY`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`, `LIVEKIT_URL`, `DEEPGRAM_API_KEY`, AWS credentials for Polly TTS, `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_DB_URL`. Optional: `LANGCHAIN_TRACING_V2`, `LANGCHAIN_API_KEY`, `LANGCHAIN_PROJECT` for LangSmith.
+Required (startup fails without them): `GEMINI_API_KEY`, `GROQ_API_KEY`, `QDRANT_URL`, `QDRANT_API_KEY`, `JWT_SECRET`.
+Feature groups: Supabase (`SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_DB_URL`), LiveKit (`LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`, `LIVEKIT_URL`), `DEEPGRAM_API_KEY`, AWS Polly credentials, `ELEVENLABS_API_KEY`, `JINA_API_KEY` (reranker + image uploads), `OPENROUTER_API_KEY` (LLM fallback), LangSmith (`LANGCHAIN_TRACING_V2`, `LANGCHAIN_API_KEY`, `LANGCHAIN_PROJECT`).
+Tuning: `GEMINI_MINI_MODEL`, `INTERVIEW_AGENT_MODE`, `INTERVIEW_TTS_PROVIDER`, `EMBEDDING_BATCH_SIZE`, `EMBEDDING_CACHE_MAX_ENTRIES`, `SESSION_TTL_MS`, `CORS_ORIGINS`, `DEEPGRAM_STT_*`, `VAD_INSTANT_BARGE_IN`.

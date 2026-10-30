@@ -69,7 +69,8 @@ export class VoiceAgentWorker {
         this.room = new Room();
         this.audioPublisher = new AudioPublisher(OUTPUT_SAMPLE_RATE, 1);
         this.geminiSession = null;
-        this.isActive = false;
+        this.isActive = false;  // fully started and running
+        this._closed = false;   // stop() ran — teardown is idempotent on this, not isActive
         this._audioQueue = [];
         this._playingAudio = false;
         this._prerollMet = false;  // has the startup pre-roll filled for this turn?
@@ -77,6 +78,16 @@ export class VoiceAgentWorker {
     }
 
     async start() {
+        try {
+            await this._start();
+        } catch (err) {
+            // Release whatever already opened (Gemini socket, LiveKit room)
+            this.stop();
+            throw err;
+        }
+    }
+
+    async _start() {
         const startTs = performance.now();
         agentLog.info({ sessionId: this.sessionId }, 'Conversational AI starting');
 
@@ -151,7 +162,6 @@ export class VoiceAgentWorker {
                     const reason = e?.reason || '';
                     agentLog.info({ sessionId: self.sessionId, reason, type: 'voice' }, 'Gemini Live closed');
                     if (self.isActive) {
-                        self.isActive = false;
                         self.stop();
                     } else if (reason) {
                         // Closed before we finished starting — propagate the error
@@ -162,6 +172,8 @@ export class VoiceAgentWorker {
                 }
             }
         });
+        // stop() may have run while we were connecting (user left, agent replaced)
+        if (this._closed) { this.stop(); return; }
 
         // 3. Connect to LiveKit room (in parallel with Gemini connection above)
         const livekitTs = performance.now();
@@ -194,6 +206,7 @@ export class VoiceAgentWorker {
             source: TrackSource.SOURCE_MICROPHONE
         });
 
+        if (this._closed) { this.stop(); return; }
         this.isActive = true;
         agentLog.info({ sessionId: this.sessionId, ms: Math.round(performance.now() - trackTs), totalMs: Math.round(performance.now() - startTs), type: 'voice' }, '[4/4] Conversational AI ready');
 
@@ -508,11 +521,17 @@ export class VoiceAgentWorker {
     }
 
     stop() {
-        if (!this.isActive) return;
-        agentLog.info({ sessionId: this.sessionId, type: 'voice' }, 'Conversational AI stopping');
+        // Safe to call repeatedly and mid-start; the resources it closes are released only once
+        const firstStop = !this._closed;
+        this._closed = true;
         this.isActive = false;
-        this._stopSpeaking();
-        try { this.geminiSession?.close(); } catch (_) {}
-        try { this.room.disconnect(); } catch (_) {}
+        if (firstStop) {
+            agentLog.info({ sessionId: this.sessionId, type: 'voice' }, 'Conversational AI stopping');
+            this._stopSpeaking();
+        }
+        const session = this.geminiSession;
+        this.geminiSession = null;
+        try { session?.close(); } catch (_) {}
+        try { Promise.resolve(this.room.disconnect()).catch(() => {}); } catch (_) {}
     }
 }

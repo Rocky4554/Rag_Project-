@@ -30,7 +30,15 @@ const PHRASE_TEXT = {
     "take_a_break":      "Of course, take your time.",
 };
 
-const FEEDBACK_ONLY_INTENTS = ['confused', 'meta', 'irrelevant', 'break_request', 'hint_request', 'gratitude', 'greeting'];
+// How long a cut-off fragment waits for the candidate to continue
+const FRAGMENT_FLUSH_MS = 3000;
+
+// Whole-utterance matches only (input lowercased, punctuation stripped) — a real
+// answer that happens to contain "repeat" or "stop" must reach the graph.
+const REPEAT_RE = /^(sorry |um |uh |can you |could you |please )*(pardon|pardon me|repeat|repeat that|repeat the question|say again|say that again|come again|once more|what was the question|what was that)( please| again)?$/;
+const COMMAND_RE = /^(yes|no|yeah|nope|ok|okay|stop|skip|pass|next|end|quit|done|hint|thanks|thank you|hello|hi|hey|pardon|repeat)( please)?$/;
+
+const FEEDBACK_ONLY_INTENTS =['confused', 'meta', 'irrelevant', 'break_request', 'hint_request', 'gratitude', 'greeting'];
 const THINKING_INTENTS = ['thinking_out_loud'];
 const CUTOFF_INTENTS = ['premature_cutoff'];
 
@@ -57,28 +65,78 @@ export class InterviewAgentWorker extends VoicePipelineWorker {
         this.candidateName = candidateName;
         this.maxQuestions = maxQuestions;
         this.currentQuestion = "";
+
+        // A fragment that looked cut off is held here and prepended to the next
+        // utterance; if nothing follows within FRAGMENT_FLUSH_MS it is processed alone.
+        this._heldFragment = null;
+        this._heldTimer = null;
+        // Question for which the "would you like a hint?" offer was already made
+        this._hintOfferedFor = null;
+    }
+
+    stop() {
+        this._clearHeldFragment();
+        super.stop();
+    }
+
+    /** End the interview from the client's "End" button: runs a stop turn through
+     *  the graph (after any turn in progress) so the final report is generated and
+     *  `interview_done` is emitted exactly as when the candidate says "stop". */
+    requestEnd() {
+        this._clearHeldFragment();
+        return this._enqueueTurn("Stop.", { flushed: true, system: true });
+    }
+
+    _clearHeldFragment() {
+        clearTimeout(this._heldTimer);
+        this._heldTimer = null;
+        this._heldFragment = null;
+    }
+
+    _holdFragment(text, acousticMeta) {
+        this._clearHeldFragment();
+        this._heldFragment = { text, acousticMeta };
+        this._heldTimer = setTimeout(() => {
+            const held = this._heldFragment;
+            this._heldFragment = null;
+            this._heldTimer = null;
+            if (!held || !this.isActive) return;
+            agentLog.info({ sessionId: this.sessionId, snippet: held.text }, 'No continuation — processing held fragment');
+            this._enqueueTurn(held.text, { ...held.acousticMeta, flushed: true });
+        }, FRAGMENT_FLUSH_MS);
     }
 
     // ── Core: handle each user turn ─────────────────────────────
 
     async onUserTranscript(transcript, acousticMeta) {
+        // Re-attach a fragment held back as incomplete
+        if (this._heldFragment) {
+            transcript = `${this._heldFragment.text} ${transcript}`;
+            this._clearHeldFragment();
+        }
+
+        // Judge completeness on the STT's own punctuation — cleanTranscript appends a period
+        const sttPunctuated = /[.?!]$/.test(transcript.trim());
+
         // Tier 1: rule-based cleanup (sync, zero cost) — strip fillers, fix repeats, capitalize
         transcript = cleanTranscript(transcript);
+        const lowerAns = transcript.trim().toLowerCase().replace(/[^a-z\s]/g, "").replace(/\s+/g, " ").trim();
 
-        // Tier 2: semantic completeness check (async, Gemini Flash) — only for short ambiguous transcripts
-        // This catches cut-offs that slipped past the STT-layer _looksIncomplete heuristic.
+        // Tier 2: semantic completeness check (async, Gemini Flash) — only for short ambiguous transcripts.
+        // Catches cut-offs that slipped past the STT-layer _looksIncomplete heuristic. Commands are
+        // complete by definition, and a fragment that already waited is processed as-is.
         const wordCount = transcript.trim().split(/\s+/).filter(Boolean).length;
-        if (wordCount < 8 && !/[.?!]$/.test(transcript.trim())) {
+        if (!acousticMeta.flushed && wordCount < 8 && !sttPunctuated && !COMMAND_RE.test(lowerAns)) {
             const isComplete = await checkSemanticCompleteness(transcript);
             if (!isComplete) {
-                agentLog.info({ sessionId: this.sessionId, snippet: transcript }, 'Semantic guard: transcript incomplete, waiting silently');
+                agentLog.info({ sessionId: this.sessionId, snippet: transcript }, 'Semantic guard: transcript incomplete, holding for continuation');
+                this._holdFragment(transcript, acousticMeta);
                 return { silent: true };
             }
         }
 
         // ── Fast-path: pardon / repeat request ──────────────────
-        const lowerAns = transcript.trim().toLowerCase().replace(/[^a-z\s]/g, "").trim();
-        if (this.currentQuestion && /\b(pardon|repeat|say again|say that again|can you repeat|what was the question|come again|once more)\b/.test(lowerAns)) {
+        if (this.currentQuestion && REPEAT_RE.test(lowerAns)) {
             agentLog.info({ sessionId: this.sessionId, transcript: transcript.substring(0, 80) }, 'Pardon/repeat request');
             return {
                 speakCustom: async () => {
@@ -88,8 +146,8 @@ export class InterviewAgentWorker extends VoicePipelineWorker {
         }
 
         // ── Fast-path: auto-hint offer when struggling (struggleStreak ≥ 2 + skip) ──
-        // Re-route "I don't know" to hint_request for struggling candidates
-        if (/\b(dont know|no idea|not sure|cant answer|i dont know)\b/.test(lowerAns)) {
+        // Offered once per question; saying "I don't know" again goes to the graph as a skip.
+        if (this._hintOfferedFor !== this.currentQuestion && /\b(dont know|no idea|not sure|cant answer|i dont know)\b/.test(lowerAns)) {
             const session = this.sessionCache[this.sessionId];
             const interviewState = session?.interviewStateConfig;
             // Check the checkpoint for struggleStreak (if available)
@@ -98,6 +156,7 @@ export class InterviewAgentWorker extends VoicePipelineWorker {
                     const snap = await this.sessionBridge.agentWorkflow.getState(interviewState);
                     if (snap?.values?.struggleStreak >= 2 && (snap?.values?.hintsGiven || 0) < 2) {
                         agentLog.info({ sessionId: this.sessionId, struggleStreak: snap.values.struggleStreak }, 'Auto-offering hint for struggling candidate');
+                        this._hintOfferedFor = this.currentQuestion;
                         // Offer a hint instead of just skipping
                         return {
                             segments: [{ text: "I can see this one's tricky. Would you like me to give you a hint? Just say 'yes' or 'give me a hint', or say 'skip' to move on." }],
@@ -174,9 +233,10 @@ export class InterviewAgentWorker extends VoicePipelineWorker {
             };
         }
 
-        // ── Premature cutoff — stay silent ──────────────────────
+        // ── Premature cutoff — stay silent, keep the fragment for the continuation ──
         if (CUTOFF_INTENTS.includes(result.intent)) {
             agentLog.info({ sessionId: this.sessionId }, 'Premature cutoff — waiting');
+            if (!acousticMeta.flushed) this._holdFragment(transcript, acousticMeta);
             return { silent: true };
         }
 
@@ -240,17 +300,17 @@ export class InterviewAgentWorker extends VoicePipelineWorker {
 
     /**
      * Speak personalised intro + first question.
-     * Called fire-and-forget from routes/interview.js.
+     * Called fire-and-forget from routes/interview.js. Queued like a turn, so no user
+     * turn runs mid-intro and a barge-in can cut the greeting short.
      */
-    async speakIntro(firstQuestion, isResume = false) {
-        if (!firstQuestion) return;
+    speakIntro(firstQuestion, isResume = false) {
+        if (!firstQuestion) return Promise.resolve();
+        // requireActive=false: the route may call this while LiveKit is still connecting
+        return this._enqueueTask(() => this._speakIntro(firstQuestion, isResume), { requireActive: false });
+    }
+
+    async _speakIntro(firstQuestion, isResume) {
         this.processingTurn = true;
-        const safetyTimer = setTimeout(() => {
-            if (this.processingTurn) {
-                agentLog.warn({ sessionId: this.sessionId }, 'speakIntro safety timeout');
-                this.processingTurn = false;
-            }
-        }, 30000);
         try {
             const introText = isResume
                 ? `Welcome back, ${this.candidateName}! Your interview session was interrupted. Let's continue right where we left off. Here is your question again.`
@@ -259,6 +319,9 @@ export class InterviewAgentWorker extends VoicePipelineWorker {
 
             // Speak intro with subtitles
             await this._speakAndEmit(introText, true, false);
+
+            // An interruption may cut the greeting, but the candidate must still hear the question
+            this._resumeTurnSpeech();
 
             // Speak first question with subtitles
             const parsed = parseTTSResponse(firstQuestion);
@@ -272,8 +335,7 @@ export class InterviewAgentWorker extends VoicePipelineWorker {
         } catch (err) {
             agentLog.error({ sessionId: this.sessionId, err: err.message }, 'speakIntro error');
         } finally {
-            clearTimeout(safetyTimer);
-            this.processingTurn = false;
+            this._endProcessing();
         }
     }
 
@@ -304,9 +366,13 @@ export class InterviewAgentWorker extends VoicePipelineWorker {
         this._emitToRoom('ai_speech', { action: 'end' });
     }
 
-    /** Speak arbitrary text with TTS tag parsing. */
-    async speak(text) {
-        if (!text) return;
+    /** Speak arbitrary text with TTS tag parsing (queued like a turn). */
+    speak(text) {
+        if (!text) return Promise.resolve();
+        return this._enqueueTask(() => this._speak(text));
+    }
+
+    async _speak(text) {
         this.processingTurn = true;
         try {
             const parsed = parseTTSResponse(text);
@@ -319,7 +385,7 @@ export class InterviewAgentWorker extends VoicePipelineWorker {
         } catch (err) {
             agentLog.error({ sessionId: this.sessionId, err: err.message }, 'speak() error');
         } finally {
-            this.processingTurn = false;
+            this._endProcessing();
         }
     }
 }

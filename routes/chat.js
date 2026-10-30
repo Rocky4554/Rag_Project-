@@ -6,6 +6,7 @@ import { saveChatMessage, getChatHistory, getDocumentBySessionId } from "../lib/
 import { ensureSession } from "../lib/sessionRestore.js";
 import { validate, chatSchema } from '../lib/validation.js';
 import { chatLog } from '../lib/logger.js';
+import { canAccessSession, publicError } from '../lib/access.js';
 import { queryImageChat, queryImageChatStream } from '../lib/pipeline/imageChat.js';
 
 export function createChatRoutes({ sessionCache }) {
@@ -19,7 +20,7 @@ export function createChatRoutes({ sessionCache }) {
 
             // Try in-memory first, then auto-restore from DB+Qdrant
             const session = await ensureSession(sessionCache, sessionId);
-            if (!session || (!session.vectorStore && session.contentType !== 'image')) {
+            if (!session || (!session.vectorStore && session.contentType !== 'image') || !canAccessSession(session, req.user)) {
                 return res.status(404).json({ error: 'Session not found or expired. Please upload the document again.' });
             }
 
@@ -78,7 +79,7 @@ export function createChatRoutes({ sessionCache }) {
         } catch (error) {
             const totalMs = Math.round(performance.now() - routeStart);
             chatLog.error({ err: error.message, totalMs }, 'Chat error');
-            res.status(500).json({ error: error.message || "Failed to get answer" });
+            res.status(500).json({ error: publicError(error, "Failed to get answer") });
         }
     });
 
@@ -90,7 +91,7 @@ export function createChatRoutes({ sessionCache }) {
             const { sessionId, question } = req.validated;
 
             const session = await ensureSession(sessionCache, sessionId);
-            if (!session || (!session.vectorStore && session.contentType !== 'image')) {
+            if (!session || (!session.vectorStore && session.contentType !== 'image') || !canAccessSession(session, req.user)) {
                 return res.status(404).json({ error: 'Session not found or expired. Please upload the document again.' });
             }
 
@@ -162,9 +163,9 @@ export function createChatRoutes({ sessionCache }) {
             const totalMs = Math.round(performance.now() - routeStart);
             chatLog.error({ err: error.message, totalMs }, 'Chat stream error');
             if (!res.headersSent) {
-                res.status(500).json({ error: error.message || "Failed to get answer" });
+                res.status(500).json({ error: publicError(error, "Failed to get answer") });
             } else {
-                res.write(`data: ${JSON.stringify({ error: error.message })}\n\n`);
+                res.write(`data: ${JSON.stringify({ error: publicError(error, "Failed to get answer") })}\n\n`);
                 res.end();
             }
         }
@@ -176,7 +177,7 @@ export function createChatRoutes({ sessionCache }) {
             if (!req.user) return res.status(401).json({ error: 'Authentication required' });
 
             const doc = await getDocumentBySessionId(req.params.sessionId);
-            if (!doc) return res.status(404).json({ error: 'Document not found' });
+            if (!doc || doc.user_id !== req.user.id) return res.status(404).json({ error: 'Document not found' });
 
             const history = await getChatHistory(doc.id, 50);
             res.json({ history });
